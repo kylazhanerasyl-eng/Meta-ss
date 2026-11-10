@@ -1,0 +1,21 @@
+INFO:     Started server process [25744]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8100 (Press CTRL+C to quit)
+INFO:     127.0.0.1:51181 - "GET /api/topics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51184 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51185 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51186 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51187 - "GET /api/topics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51188 - "POST /api/applications/apply HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51189 - "GET /api/applications HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51190 - "POST /api/applications/decide HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51191 - "POST /api/applications/decide HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51192 - "POST /api/allocation/gale-shapley?dry_run=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51193 - "POST /api/allocation/gale-shapley?apply=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51194 - "POST /api/head/confirm-all HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51195 - "GET /api/export/pdf-order HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51196 - "GET /api/applications HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51197 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51198 - "POST /api/applications/decide HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:51199 - "POST /api/applications/decide HTTP/1.1" 400 Bad Request

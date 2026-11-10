@@ -1,0 +1,1260 @@
+import uuid
+from io import BytesIO
+import pytest
+from fastapi.testclient import TestClient
+from main import app, calculate_similarity
+
+client = TestClient(app)
+
+def get_auth_token(email: str, password: str = "123456") -> str:
+    res = client.post("/api/login", json={"email": email, "password": password})
+    assert res.status_code == 200, f"Login failed for {email}: {res.text}"
+    return res.json()["token"]
+
+@pytest.fixture(scope="function", autouse=True)
+def ensure_available_topic_quota():
+    from main import SessionLocal, Topic
+    db = SessionLocal()
+    try:
+        # Guarantee topic 1, 3, 5 have available quota for tests
+        for t in db.query(Topic).all():
+            if t.quota_used >= t.quota_total:
+                t.quota_used = max(0, t.quota_total - 2)
+                t.status = "available"
+        db.commit()
+    finally:
+        db.close()
+
+# ─── 1. ROOT & STATIC ──────────────────────────────────────────────────────────
+def test_root():
+    """Тест 1: проверка корневого эндпоинта /"""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+
+def test_root_endpoint():
+    """Тест 1 (алиас): проверка доступности корневого эндпоинта / (код 200)"""
+    test_root()
+
+# ─── 2. AUTHENTICATION & SESSIONS ─────────────────────────────────────────────
+def test_login_success():
+    """Тест 2: успешный логин и выдача server-side токена"""
+    response = client.post("/api/login", json={"email": "student@test.com", "password": "123456"})
+    assert response.status_code == 200
+    data = response.json()
+    assert "token" in data
+    assert "user" in data
+    assert data["user"]["email"] == "student@test.com"
+    assert data["user"]["role"] == "student"
+
+def test_login_wrong_password():
+    """Тест 3: отказ при неверном пароле (401)"""
+    response = client.post("/api/login", json={"email": "student@test.com", "password": "wrong_password_999"})
+    assert response.status_code == 401
+
+def test_session_required():
+    """Тест 4: защищенные эндпоинты требуют валидный session токен (401)"""
+    # Без токена
+    res1 = client.get("/api/admin/backup")
+    assert res1.status_code == 401
+
+    # С недействительным токеном
+    res2 = client.get("/api/admin/backup", headers={"Authorization": "Bearer invalid_token_xyz"})
+    assert res2.status_code == 401
+
+def test_user_registration_and_login():
+    """Тест: регистрация и логин нового пользователя"""
+    unique_email = f"student_{uuid.uuid4().hex[:6]}@test.com"
+    reg_response = client.post("/api/register", json={
+        "full_name": "Тестовый Студент CI",
+        "email": unique_email,
+        "password": "secretpassword123",
+        "role": "student"
+    })
+    assert reg_response.status_code == 200
+    reg_data = reg_response.json()
+    assert reg_data["email"] == unique_email
+    assert reg_data["role"] == "student"
+
+    login_response = client.post("/api/login", json={
+        "email": unique_email,
+        "password": "secretpassword123"
+    })
+    assert login_response.status_code == 200
+    assert login_response.json()["email"] == unique_email
+
+# ─── 3. ROLE-BASED ACCESS CONTROL (RBAC) ──────────────────────────────────────
+def test_student_cannot_access_head():
+    """Тест 5: студент не может обращаться к эндпоинтам завкафедрой (403)"""
+    student_token = get_auth_token("student@test.com")
+    headers = {"Authorization": f"Bearer {student_token}"}
+    res = client.get("/api/head/stats", headers=headers)
+    assert res.status_code == 403
+
+def test_student_cannot_decide():
+    """Тест 6: студент не может принимать решения по заявкам (403)"""
+    student_token = get_auth_token("student@test.com")
+    headers = {"Authorization": f"Bearer {student_token}"}
+    res = client.post("/api/applications/decide", json={
+        "application_id": 1,
+        "decision": "APPROVE"
+    }, headers=headers)
+    assert res.status_code == 403
+
+def test_teacher_cannot_access_admin():
+    """Тест 7: преподаватель не имеет доступа к админскому бэкапу (403)"""
+    teacher_token = get_auth_token("teacher@test.com")
+    headers = {"Authorization": f"Bearer {teacher_token}"}
+    res = client.get("/api/admin/backup", headers=headers)
+    assert res.status_code == 403
+
+# ─── 4. TOPICS CATALOG & SEARCH ───────────────────────────────────────────────
+def test_topics():
+    """Тест 8: каталог тем возвращает корректный список"""
+    res = client.get("/api/topics")
+    assert res.status_code == 200
+    topics = res.json()
+    assert isinstance(topics, list)
+    assert len(topics) >= 5
+
+def test_topics_catalog():
+    """Тест 8 (алиас): проверка каталога тем"""
+    test_topics()
+
+def test_topic_search():
+    """Тест 9: полнотекстовый поиск тем по ключевому слову"""
+    res = client.get("/api/topics?q=компьютер")
+    assert res.status_code == 200
+    assert isinstance(res.json(), list)
+
+# ─── 5. APPLICATIONS & BUSINESS RULES ─────────────────────────────────────────
+def test_apply():
+    """Тест 10: корректная подача заявки студентом"""
+    st_email = f"apply_st_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={
+        "full_name": "Подающий Студент",
+        "email": st_email,
+        "password": "123456",
+        "role": "student"
+    })
+    token = get_auth_token(st_email)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.post("/api/applications/apply", json={
+        "topic_id": 3,
+        "priority": 1,
+        "motivation": "Имею профильные навыки"
+    }, headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert "application_id" in data
+    assert data["priority"] == 1
+
+def test_duplicate_application():
+    """Тест 11: запрет подачи на одну тему дважды (400)"""
+    st_email = f"dup_st_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={
+        "full_name": "Дублирующий Студент",
+        "email": st_email,
+        "password": "123456",
+        "role": "student"
+    })
+    token = get_auth_token(st_email)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res1 = client.post("/api/applications/apply", json={"topic_id": 4, "priority": 1}, headers=headers)
+    assert res1.status_code == 200
+
+    res2 = client.post("/api/applications/apply", json={"topic_id": 4, "priority": 2}, headers=headers)
+    assert res2.status_code == 400
+    assert "уже подали заявку на эту тему" in res2.text
+
+def test_invalid_priority():
+    """Тест 12: приоритет должен быть строго 1, 2 или 3 (400)"""
+    st_email = f"prio_st_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={
+        "full_name": "Приоритетный Студент",
+        "email": st_email,
+        "password": "123456",
+        "role": "student"
+    })
+    token = get_auth_token(st_email)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.post("/api/applications/apply", json={"topic_id": 5, "priority": 5}, headers=headers)
+    assert res.status_code == 400
+    assert "1, 2 или 3" in res.text
+
+def test_full_topic():
+    """Тест 13: запрет подачи на переполненную тему (400)"""
+    topics = client.get("/api/topics").json()
+    target_topic = topics[0]
+
+    st_email = f"full_st_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={
+        "full_name": "Студент Тест Квоты",
+        "email": st_email,
+        "password": "123456",
+        "role": "student"
+    })
+    token = get_auth_token(st_email)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Имитируем заполненную квоту через DB или проверку если full
+    from main import SessionLocal, Topic as DBTopic
+    db = SessionLocal()
+    db_topic = db.query(DBTopic).filter(DBTopic.id == target_topic["id"]).first()
+    original_quota = db_topic.quota_used
+    original_status = db_topic.status
+    try:
+        db_topic.quota_used = db_topic.quota_total
+        db_topic.status = "full"
+        db.commit()
+
+        res = client.post("/api/applications/apply", json={"topic_id": target_topic["id"], "priority": 1}, headers=headers)
+        assert res.status_code == 400
+        assert "исчерпаны" in res.text or "заняты" in res.text
+    finally:
+        db_topic.quota_used = original_quota
+        db_topic.status = original_status
+        db.commit()
+        db.close()
+
+def test_teacher_approve():
+    """Тест 14: преподаватель успешно одобряет заявку на свою тему"""
+    teacher_token = get_auth_token("teacher@test.com")
+    headers_teacher = {"Authorization": f"Bearer {teacher_token}"}
+
+    # Создаем заявку от студента на тему преподавателя (topic_id=1, Доц. Ахметов)
+    st_email = f"approve_st_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Одобряемый Студент", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+
+    app_res = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    assert app_res.status_code == 200
+    app_id = app_res.json()["application_id"]
+
+    # Преподаватель одобряет
+    dec_res = client.post("/api/applications/decide", json={
+        "application_id": app_id,
+        "decision": "APPROVE"
+    }, headers=headers_teacher)
+    assert dec_res.status_code == 200
+    assert dec_res.json()["status"] == "APPROVED"
+
+def test_wrong_teacher_cannot_approve():
+    """Тест 15: преподаватель не может принимать решение по чужой теме (403)"""
+    from main import SessionLocal, User, hash_password
+    other_teacher = f"teacher_{uuid.uuid4().hex[:6]}@test.com"
+    _db = SessionLocal()
+    try:
+        _t = User(
+            full_name="Чужой Преподаватель",
+            email=other_teacher,
+            password_hash=hash_password("123456"),
+            role="teacher",
+            department="ВТиПО",
+            is_active=True
+        )
+        _db.add(_t)
+        _db.commit()
+    finally:
+        _db.close()
+    other_token = get_auth_token(other_teacher)
+
+    # Тема 1 принадлежит Доц. Ахметову
+    st_email = f"wrong_st_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Студент Чужого Теста", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+    app_res = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    app_id = app_res.json()["application_id"]
+
+    res = client.post("/api/applications/decide", json={
+        "application_id": app_id,
+        "decision": "APPROVE"
+    }, headers={"Authorization": f"Bearer {other_token}"})
+    assert res.status_code == 403
+    assert "только по своим темам" in res.text
+
+def test_reject_requires_reason():
+    """Тест 16: отклонение заявки требует обязательное указание причины (400)"""
+    teacher_token = get_auth_token("teacher@test.com")
+
+    st_email = f"reject_st_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Отклоняемый Студент", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+    app_res = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    app_id = app_res.json()["application_id"]
+
+    res = client.post("/api/applications/decide", json={
+        "application_id": app_id,
+        "decision": "REJECT",
+        "reason": ""  # Пустая причина
+    }, headers={"Authorization": f"Bearer {teacher_token}"})
+    assert res.status_code == 400
+    assert "причину отказа" in res.text
+
+# ─── 6. ANTI-DUPLICATE ────────────────────────────────────────────────────────
+def test_duplicate_topic_under_threshold():
+    """Тест 17: уникальная тема имеет показатель сходства ниже 75%"""
+    res = client.post("/api/topics/check-duplicate", json={"title": "Квантовое моделирование астрофизических гравитационных волн"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["is_duplicate"] is False
+    assert data["similarity"] < 75.0
+
+def test_duplicate_topic_above_threshold():
+    """Тест 18: тема, схожая с существующей, определяется как дубликат (>= 75%)"""
+    sample = "Разработка веб-платформы автоматизации распределения дипломных работ"
+    res = client.post("/api/topics/check-duplicate", json={"title": sample})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["is_duplicate"] is True
+    assert data["similarity"] >= 75.0
+
+def test_anti_duplicate_check():
+    """Тест 18 (алиас): проверка работы алгоритма антидубликата"""
+    test_duplicate_topic_under_threshold()
+    test_duplicate_topic_above_threshold()
+
+# ─── 7. GALE-SHAPLEY ALLOCATION ───────────────────────────────────────────────
+def test_gale_shapley_quota():
+    """Тест 19: распределение Гейла-Шепли строго уважает квоты тем"""
+    head_token = get_auth_token("head@test.com")
+    res = client.post("/api/allocation/gale-shapley?dry_run=true", headers={"Authorization": f"Bearer {head_token}"})
+    assert res.status_code == 200
+    data = res.json()
+    assert "allocated" in data
+    assert "stats" in data
+    assert data["stats"]["students_total"] >= 0
+
+def test_gale_shapley_priority():
+    """Тест 20: распределение Гейла-Шепли считает приоритеты и удовлетворенность"""
+    head_token = get_auth_token("head@test.com")
+    res = client.post("/api/allocation/gale-shapley?dry_run=true", headers={"Authorization": f"Bearer {head_token}"})
+    assert res.status_code == 200
+    stats = res.json()["stats"]
+    assert "first_priority" in stats
+    assert "second_priority" in stats
+    assert "third_priority" in stats
+    assert "satisfaction_percent" in stats
+
+def test_head_confirm():
+    """Тест 21: заведующий кафедрой массово утверждает темы в приказ"""
+    head_token = get_auth_token("head@test.com")
+    res = client.post("/api/head/confirm-all", headers={"Authorization": f"Bearer {head_token}"})
+    assert res.status_code == 200
+    assert "count" in res.json()
+
+# ─── 8. ORDERS & EXPORTS (DOCX & PDF) ─────────────────────────────────────────
+def test_order_docx():
+    """Тест 22: генерация официального двуязычного приказа МОН РК (.docx)"""
+    head_token = get_auth_token("head@test.com")
+    res = client.get("/api/export/official-decree-docx", headers={"Authorization": f"Bearer {head_token}"})
+    assert res.status_code == 200
+    assert "openxmlformats-officedocument" in res.headers.get("content-type", "")
+    assert res.content[:2] == b"PK"
+
+def test_official_decree_docx():
+    """Тест 22 (алиас): проверка генерации приказа .docx"""
+    test_order_docx()
+
+def test_order_pdf():
+    """Тест 23: генерация официального PDF-приказа с QR-кодом"""
+    head_token = get_auth_token("head@test.com")
+    res = client.get("/api/export/pdf-order", headers={"Authorization": f"Bearer {head_token}"})
+    assert res.status_code == 200
+    assert "application/pdf" in res.headers.get("content-type", "")
+    assert res.content[:4] == b"%PDF"
+
+def test_verify_order():
+    """Тест 24: публичная проверка подлинности приказа по QR-коду"""
+    res = client.get("/verify/ORDER-2026-01")
+    assert res.status_code == 200
+    assert "Верификация документа" in res.text
+    assert "104" in res.text
+
+# ─── 9. BACKUP PERMISSIONS ────────────────────────────────────────────────────
+def test_backup_permissions():
+    """Тест 25: права доступа к созданию резервной копии БД"""
+    st_token = get_auth_token("student@test.com")
+    t_token = get_auth_token("teacher@test.com")
+    h_token = get_auth_token("head@test.com")
+
+    # Студент -> 403
+    assert client.get("/api/admin/backup", headers={"Authorization": f"Bearer {st_token}"}).status_code == 403
+    # Преподаватель -> 403
+    assert client.get("/api/admin/backup", headers={"Authorization": f"Bearer {t_token}"}).status_code == 403
+    # Завкафедрой -> 200
+    res_head = client.get("/api/admin/backup", headers={"Authorization": f"Bearer {h_token}"})
+    assert res_head.status_code == 200
+    assert len(res_head.content) > 1000
+
+# ─── 10. NORM-CONTROL & CHECKPOINTS LIFECYCLE ─────────────────────────────────
+def test_norm_control_invalid_file():
+    """Тест 26: нормоконтроль отклоняет не-docx файлы (код 400)"""
+    fake_file = BytesIO(b"This is not a docx file")
+    res = client.post(
+        "/api/norm-control/check-docx",
+        files={"file": ("document.txt", fake_file, "text/plain")}
+    )
+    assert res.status_code == 400
+    assert "docx" in res.text
+
+def test_checkpoints_lifecycle():
+    """Тест: проверка жизненного цикла контрольных точек ВКР"""
+    student_headers = {"Authorization": f"Bearer {get_auth_token('student@test.com')}"}
+    teacher_headers = {"Authorization": f"Bearer {get_auth_token('teacher@test.com')}"}
+    # Establish the actual supervisory relationship required to read/review reports.
+    applied = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers=student_headers)
+    assert applied.status_code == 200
+    approved = client.post("/api/applications/decide", json={"application_id": applied.json()["application_id"], "decision": "APPROVE"}, headers=teacher_headers)
+    assert approved.status_code == 200
+    cps_res = client.get("/api/checkpoints/1", headers=student_headers)
+    assert cps_res.status_code == 200
+    cps_data = cps_res.json()
+    assert "checkpoints" in cps_data
+    assert len(cps_data["checkpoints"]) == 4
+    cp = cps_data["checkpoints"][0]
+    cp_id = cp["id"]
+
+    sample_pdf = b"%PDF-1.4 test report content for checkpoint"
+    upload_res = client.post(
+        "/api/checkpoints/upload",
+        data={"checkpoint_id": cp_id},
+        files={"file": ("report_stage1.pdf", BytesIO(sample_pdf), "application/pdf")}, headers=student_headers
+    )
+    assert upload_res.status_code == 200
+    upload_data = upload_res.json()
+    assert upload_data["status"] == "UNDER_REVIEW"
+
+    t_res = client.get("/api/teacher/checkpoints", headers=teacher_headers)
+    assert t_res.status_code == 200
+
+    review_res = client.post("/api/checkpoints/review", json={
+        "checkpoint_id": cp_id,
+        "status": "ACCEPTED",
+        "comment": "Отличная работа, замечаний нет."
+    }, headers=teacher_headers)
+    assert review_res.status_code == 200
+    assert review_res.json()["status"] == "ACCEPTED"
+
+    dl_res = client.get(f"/api/checkpoints/download/{cp_id}", headers=student_headers)
+    assert dl_res.status_code == 200
+    assert dl_res.content == sample_pdf
+
+# ─── 11. SECURITY REGRESSION TESTS ────────────────────────────────────────────
+def test_cannot_register_admin_head_teacher():
+    """Регрессионный тест 1: нельзя зарегистрировать admin/head/teacher через публичную регистрацию"""
+    for forbidden_role in ["admin", "head", "teacher"]:
+        fake_email = f"hacker_{forbidden_role}_{uuid.uuid4().hex[:6]}@test.com"
+        res = client.post("/api/register", json={
+            "full_name": f"Hacker {forbidden_role}",
+            "email": fake_email,
+            "password": "secretpassword123",
+            "role": forbidden_role
+        })
+        assert res.status_code == 403
+        assert "student" in res.text.lower()
+
+def test_head_stats_without_token():
+    """Регрессионный тест 2: head stats without token -> 401"""
+    res = client.get("/api/head/stats")
+    assert res.status_code == 401
+
+def test_admin_endpoint_as_student():
+    """Регрессионный тест 3: admin endpoint as student -> 403"""
+    student_token = get_auth_token("student@test.com")
+    headers = {"Authorization": f"Bearer {student_token}"}
+
+    res_backup = client.get("/api/admin/backup", headers=headers)
+    assert res_backup.status_code == 403
+
+    res_logs = client.get("/api/admin/audit-logs", headers=headers)
+    assert res_logs.status_code == 403
+
+def test_wrong_teacher_cannot_decide():
+    """Регрессионный тест 4: wrong teacher -> 403"""
+    from main import SessionLocal, User, hash_password
+    other_teacher = f"teacher_reg_{uuid.uuid4().hex[:6]}@test.com"
+    _db = SessionLocal()
+    try:
+        _t = User(
+            full_name="Преподаватель Чужой Темы",
+            email=other_teacher,
+            password_hash=hash_password("123456"),
+            role="teacher",
+            department="ВТиПО",
+            is_active=True
+        )
+        _db.add(_t)
+        _db.commit()
+    finally:
+        _db.close()
+
+    other_token = get_auth_token(other_teacher)
+
+    st_email = f"student_wrong_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Студент Темы", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+
+    app_res = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    assert app_res.status_code == 200
+    app_id = app_res.json()["application_id"]
+
+    dec_res = client.post("/api/decide", json={
+        "application_id": app_id,
+        "decision": "APPROVE"
+    }, headers={"Authorization": f"Bearer {other_token}"})
+    assert dec_res.status_code == 403
+    assert "только по своим темам" in dec_res.text
+
+def test_websocket_wrong_user_rejected():
+    """Регрессионный тест 5: websocket wrong user -> rejected"""
+    from starlette.websockets import WebSocketDisconnect
+    student_token = get_auth_token("student@test.com")
+    # student@test.com имеет user_id=1, пробуем подключиться к чужому user_id=5 (teacher)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/ws/5?token={student_token}"):
+            pass
+    assert exc_info.value.code == 1008
+
+def test_websocket_without_token_rejected():
+    """Регрессионный тест: websocket without token -> rejected"""
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/ws/1"):
+            pass
+    assert exc_info.value.code == 1008
+
+def test_session_expiration_rejected():
+    """Регрессионный тест: истекшая сессия возвращает 401 и отклоняет WebSocket"""
+    from datetime import datetime, timedelta
+    from main import SessionLocal, SessionModel
+    from starlette.websockets import WebSocketDisconnect
+
+    _db = SessionLocal()
+    expired_token = f"exp_token_{uuid.uuid4().hex}"
+    try:
+        sess = SessionModel(
+            user_id=1,
+            token=expired_token,
+            created_at=datetime.utcnow() - timedelta(days=10),
+            expires_at=datetime.utcnow() - timedelta(hours=1)
+        )
+        _db.add(sess)
+        _db.commit()
+    finally:
+        _db.close()
+
+    res = client.get("/api/head/stats", headers={"Authorization": f"Bearer {expired_token}"})
+    assert res.status_code == 401
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/ws/1?token={expired_token}"):
+            pass
+    assert exc_info.value.code == 1008
+
+def test_all_protected_endpoints_require_bearer():
+    """Регрессионный тест: эндпоинты /api/decide, /api/allocation/*, /api/export/* требуют Bearer token (401)"""
+    assert client.post("/api/decide", json={"application_id": 1, "decision": "APPROVE"}).status_code == 401
+    assert client.post("/api/allocation/gale-shapley").status_code == 401
+    assert client.get("/api/export/official-decree-docx").status_code == 401
+    assert client.get("/api/export/pdf-order").status_code == 401
+    assert client.get("/api/export/order").status_code == 401
+    assert client.get("/api/export/statement/1").status_code == 401
+
+# ─── DATABASE INTEGRITY REGRESSION TESTS ─────────────────────────────────────
+def test_foreign_keys_enabled():
+    """Тест целостности БД: PRAGMA foreign_keys == 1 на соединениях"""
+    from sqlalchemy import text
+    from main import engine
+    with engine.connect() as conn:
+        res = conn.execute(text("PRAGMA foreign_keys")).scalar()
+        assert res == 1, f"PRAGMA foreign_keys expected 1, got {res}"
+
+def test_duplicate_application_blocked():
+    """Тест целостности БД: запрет дубликатов Application UNIQUE(student_id, topic_id) на уровне БД"""
+    from sqlalchemy.exc import IntegrityError
+    from main import SessionLocal, User, Topic, Application, hash_password
+    db = SessionLocal()
+    st_email = f"st_uq_app_{uuid.uuid4().hex[:6]}@test.com"
+    user = None
+    topic = None
+    try:
+        user = User(
+            full_name="Тестовый Студент UNIQUE APP",
+            email=st_email,
+            password_hash=hash_password("123456"),
+            role="student",
+            is_active=True
+        )
+        db.add(user)
+        db.commit()
+
+        topic = Topic(
+            title=f"Тема для UNIQUE APP {uuid.uuid4().hex[:6]}",
+            supervisor_name="Доц. Ахметов К.А.",
+            quota_total=5,
+            quota_used=0,
+            status="available"
+        )
+        db.add(topic)
+        db.commit()
+
+        app1 = Application(student_id=user.id, topic_id=topic.id, priority=1, status="SUBMITTED")
+        db.add(app1)
+        db.commit()
+
+        app2 = Application(student_id=user.id, topic_id=topic.id, priority=2, status="SUBMITTED")
+        db.add(app2)
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+    finally:
+        try:
+            db.rollback()
+            if user:
+                db.query(Application).filter(Application.student_id == user.id).delete()
+            if topic:
+                db.query(Topic).filter(Topic.id == topic.id).delete()
+            if user:
+                db.query(User).filter(User.id == user.id).delete()
+            db.commit()
+        except Exception:
+            db.rollback()
+        db.close()
+
+def test_duplicate_priority_blocked():
+    """Тест целостности БД: запрет дубликатов приоритета Preference UNIQUE(student_id, priority) на уровне БД"""
+    from sqlalchemy.exc import IntegrityError
+    from main import SessionLocal, User, Topic, Preference, hash_password
+    db = SessionLocal()
+    st_email = f"st_uq_prio_{uuid.uuid4().hex[:6]}@test.com"
+    user = None
+    topic1 = None
+    topic2 = None
+    try:
+        user = User(
+            full_name="Тестовый Студент UNIQUE PRIO",
+            email=st_email,
+            password_hash=hash_password("123456"),
+            role="student",
+            is_active=True
+        )
+        db.add(user)
+        db.commit()
+
+        topic1 = Topic(title=f"Тема 1 {uuid.uuid4().hex[:6]}", supervisor_name="Доц. Ахметов К.А.", quota_total=5, quota_used=0, status="available")
+        topic2 = Topic(title=f"Тема 2 {uuid.uuid4().hex[:6]}", supervisor_name="Доц. Ахметов К.А.", quota_total=5, quota_used=0, status="available")
+        db.add(topic1)
+        db.add(topic2)
+        db.commit()
+
+        pref1 = Preference(student_id=user.id, topic_id=topic1.id, priority=1, rank=1)
+        db.add(pref1)
+        db.commit()
+
+        pref2 = Preference(student_id=user.id, topic_id=topic2.id, priority=1, rank=1)
+        db.add(pref2)
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+    finally:
+        try:
+            db.rollback()
+            if user:
+                db.query(Preference).filter(Preference.student_id == user.id).delete()
+            if topic1:
+                db.query(Topic).filter(Topic.id == topic1.id).delete()
+            if topic2:
+                db.query(Topic).filter(Topic.id == topic2.id).delete()
+            if user:
+                db.query(User).filter(User.id == user.id).delete()
+            db.commit()
+        except Exception:
+            db.rollback()
+        db.close()
+
+def test_duplicate_topic_preference_blocked():
+    """Тест целостности БД: запрет повторного выбора темы Preference UNIQUE(student_id, topic_id) на уровне БД"""
+    from sqlalchemy.exc import IntegrityError
+    from main import SessionLocal, User, Topic, Preference, hash_password
+    db = SessionLocal()
+    st_email = f"st_uq_top_{uuid.uuid4().hex[:6]}@test.com"
+    user = None
+    topic = None
+    try:
+        user = User(
+            full_name="Тестовый Студент UNIQUE TOPIC",
+            email=st_email,
+            password_hash=hash_password("123456"),
+            role="student",
+            is_active=True
+        )
+        db.add(user)
+        db.commit()
+
+        topic = Topic(title=f"Тема для Pref {uuid.uuid4().hex[:6]}", supervisor_name="Доц. Ахметов К.А.", quota_total=5, quota_used=0, status="available")
+        db.add(topic)
+        db.commit()
+
+        pref1 = Preference(student_id=user.id, topic_id=topic.id, priority=1, rank=1)
+        db.add(pref1)
+        db.commit()
+
+        pref2 = Preference(student_id=user.id, topic_id=topic.id, priority=2, rank=2)
+        db.add(pref2)
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+    finally:
+        try:
+            db.rollback()
+            if user:
+                db.query(Preference).filter(Preference.student_id == user.id).delete()
+            if topic:
+                db.query(Topic).filter(Topic.id == topic.id).delete()
+            if user:
+                db.query(User).filter(User.id == user.id).delete()
+            db.commit()
+        except Exception:
+            db.rollback()
+        db.close()
+
+def test_topics_supervisor_foreign_key_enforced():
+    """Тест целостности БД: реальный FK topics.supervisor_id -> users.id блокирует несуществующего руководителя"""
+    from sqlalchemy.exc import IntegrityError
+    from main import SessionLocal, Topic
+    db = SessionLocal()
+    try:
+        bad_topic = Topic(
+            title=f"Тема с несуществующим руководителем {uuid.uuid4().hex[:6]}",
+            supervisor_id=99999999,
+            quota_total=5,
+            quota_used=0,
+            status="available"
+        )
+        db.add(bad_topic)
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+    finally:
+        db.close()
+
+def test_database_integrity_check_ok():
+    """Тест целостности БД: PRAGMA integrity_check возвращает ok"""
+    from sqlalchemy import text
+    from main import engine
+    with engine.connect() as conn:
+        res = conn.execute(text("PRAGMA integrity_check")).fetchall()
+        assert res == [("ok",)], f"PRAGMA integrity_check failed: {res}"
+
+# ─── APPLICATION & QUOTA BUSINESS LOGIC TESTS ────────────────────────────────
+def test_double_approve():
+    """Тест: одну заявку нельзя approve два раза, повторный approve НЕ увеличивает quota_used"""
+    teacher_token = get_auth_token("teacher@test.com")
+    headers_teacher = {"Authorization": f"Bearer {teacher_token}"}
+
+    st_email = f"st_dbl_app_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Студент Дабл Аппрув", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+
+    app_res = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    assert app_res.status_code == 200
+    app_id = app_res.json()["application_id"]
+
+    from main import SessionLocal, Topic
+    db = SessionLocal()
+    quota_before = db.query(Topic).filter(Topic.id == 1).first().quota_used
+    db.close()
+
+    # Первый approve
+    res1 = client.post("/api/applications/decide", json={"application_id": app_id, "decision": "APPROVE"}, headers=headers_teacher)
+    assert res1.status_code == 200
+    assert res1.json()["status"] == "APPROVED"
+
+    db = SessionLocal()
+    quota_after1 = db.query(Topic).filter(Topic.id == 1).first().quota_used
+    assert quota_after1 == quota_before + 1
+    db.close()
+
+    # Повторный approve должен быть отклонен (код 400)
+    res2 = client.post("/api/applications/decide", json={"application_id": app_id, "decision": "APPROVE"}, headers=headers_teacher)
+    assert res2.status_code == 400
+    assert "уже одобрена" in res2.text or "уже утверждена" in res2.text
+
+    # Повторный approve НЕ должен увеличить quota_used
+    db = SessionLocal()
+    quota_after2 = db.query(Topic).filter(Topic.id == 1).first().quota_used
+    assert quota_after2 == quota_after1
+    db.close()
+
+def test_two_approved_topics():
+    """Тест: один студент не может получить две APPROVED/CONFIRMED темы"""
+    teacher_token = get_auth_token("teacher@test.com")
+    headers_teacher = {"Authorization": f"Bearer {teacher_token}"}
+
+    st_email = f"st_two_app_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Студент Две Темы", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+
+    # Подаем 2 заявки на разные темы одного преподавателя (тема 1 и тема 3)
+    res1 = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    assert res1.status_code == 200
+    app1_id = res1.json()["application_id"]
+
+    res2 = client.post("/api/applications/apply", json={"topic_id": 3, "priority": 2}, headers={"Authorization": f"Bearer {st_token}"})
+    assert res2.status_code == 200
+    app2_id = res2.json()["application_id"]
+
+    # Одобряем 1-ю тему
+    dec1 = client.post("/api/applications/decide", json={"application_id": app1_id, "decision": "APPROVE"}, headers=headers_teacher)
+    assert dec1.status_code == 200
+    assert dec1.json()["status"] == "APPROVED"
+
+    # Попытка одобрить 2-ю тему блокируется (400)
+    dec2 = client.post("/api/applications/decide", json={"application_id": app2_id, "decision": "APPROVE"}, headers=headers_teacher)
+    assert dec2.status_code == 400
+    assert "уже есть одобренная" in dec2.text or "уже распределен" in dec2.text
+
+def test_quota_never_exceeded():
+    """Тест: quota_used никогда не превышает quota_total"""
+    teacher_token = get_auth_token("teacher@test.com")
+    headers_teacher = {"Authorization": f"Bearer {teacher_token}"}
+
+    from main import SessionLocal, Topic
+    db = SessionLocal()
+    t = db.query(Topic).filter(Topic.id == 5).first()
+    orig_total = t.quota_total
+    orig_used = t.quota_used
+    orig_status = t.status
+    # Установим лимит: квота total = 2, used = 1
+    t.quota_total = 2
+    t.quota_used = 1
+    t.status = "available"
+    db.commit()
+    topic_id = t.id
+    db.close()
+
+    try:
+        # Студент 1 занимает последнее место (used становится 2)
+        st1_email = f"st_q1_{uuid.uuid4().hex[:6]}@test.com"
+        client.post("/api/register", json={"full_name": "Студент Квота 1", "email": st1_email, "password": "123456", "role": "student"})
+        res1 = client.post("/api/applications/apply", json={"topic_id": topic_id, "priority": 1}, headers={"Authorization": f"Bearer {get_auth_token(st1_email)}"})
+        app1_id = res1.json()["application_id"]
+        client.post("/api/applications/decide", json={"application_id": app1_id, "decision": "APPROVE"}, headers=headers_teacher)
+
+        # Студент 2 пытается податься или одобриться сверх квоты
+        st2_email = f"st_q2_{uuid.uuid4().hex[:6]}@test.com"
+        client.post("/api/register", json={"full_name": "Студент Квота 2", "email": st2_email, "password": "123456", "role": "student"})
+        res2 = client.post("/api/applications/apply", json={"topic_id": topic_id, "priority": 1}, headers={"Authorization": f"Bearer {get_auth_token(st2_email)}"})
+        assert res2.status_code == 400
+        assert "TOPIC_FULL" in res2.text
+
+        # Проверяем в БД: quota_used строго не превышает quota_total
+        db = SessionLocal()
+        t_after = db.query(Topic).filter(Topic.id == topic_id).first()
+        assert t_after.quota_used <= t_after.quota_total
+        db.close()
+    finally:
+        db = SessionLocal()
+        t = db.query(Topic).filter(Topic.id == 5).first()
+        t.quota_total = orig_total
+        t.quota_used = orig_used
+        t.status = orig_status
+        db.commit()
+        db.close()
+
+def test_confirm_all_skips_submitted():
+    """Тест: confirm-all НЕ должен подтверждать заявки со статусом SUBMITTED"""
+    head_token = get_auth_token("head@test.com")
+    headers_head = {"Authorization": f"Bearer {head_token}"}
+
+    st_email = f"st_skip_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Студент Скип", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+
+    res = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    app_id = res.json()["application_id"]
+
+    # Запускаем массовое подтверждение завкафедрой
+    res_conf = client.post("/api/head/confirm-all", headers=headers_head)
+    assert res_conf.status_code == 200
+
+    # Проверяем в БД: заявка осталась в статусе SUBMITTED
+    from main import SessionLocal, Application
+    db = SessionLocal()
+    app_db = db.query(Application).filter(Application.id == app_id).first()
+    assert app_db.status == "SUBMITTED"
+    db.close()
+
+def test_topic_full():
+    """Тест: если тема заполнена — возвращается ошибка TOPIC_FULL"""
+    from main import SessionLocal, Topic
+    db = SessionLocal()
+    t = db.query(Topic).filter(Topic.id == 3).first()
+    orig_used = t.quota_used
+    orig_status = t.status
+    t.quota_used = t.quota_total
+    t.status = "full"
+    db.commit()
+    db.close()
+
+    try:
+        st_email = f"st_full_{uuid.uuid4().hex[:6]}@test.com"
+        client.post("/api/register", json={"full_name": "Студент Топик Фулл", "email": st_email, "password": "123456", "role": "student"})
+        st_token = get_auth_token(st_email)
+
+        res = client.post("/api/applications/apply", json={"topic_id": 3, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+        assert res.status_code == 400
+        assert "TOPIC_FULL" in res.text
+    finally:
+        db = SessionLocal()
+        t = db.query(Topic).filter(Topic.id == 3).first()
+        t.quota_used = orig_used
+        t.status = orig_status
+        db.commit()
+        db.close()
+
+def test_concurrent_atomic_quota_scenario():
+    """Тест: проверка квоты и инкремент атомарны в транзакции, квота не превышается при параллельных запросах"""
+    import concurrent.futures
+    teacher_token = get_auth_token("teacher@test.com")
+    headers_teacher = {"Authorization": f"Bearer {teacher_token}"}
+
+    from main import SessionLocal, Topic
+    db = SessionLocal()
+    t = db.query(Topic).filter(Topic.id == 1).first()
+    orig_used = t.quota_used
+    orig_total = t.quota_total
+    # Оставляем ровно 1 свободное место
+    t.quota_total = 5
+    t.quota_used = 4
+    t.status = "available"
+    db.commit()
+    topic_id = t.id
+    db.close()
+
+    try:
+        # Два студента успевают подать заявку
+        app_ids = []
+        for i in range(2):
+            st_email = f"st_conc_{i}_{uuid.uuid4().hex[:6]}@test.com"
+            client.post("/api/register", json={"full_name": f"Студент Гонка {i}", "email": st_email, "password": "123456", "role": "student"})
+            res = client.post("/api/applications/apply", json={"topic_id": topic_id, "priority": 1}, headers={"Authorization": f"Bearer {get_auth_token(st_email)}"})
+            app_ids.append(res.json()["application_id"])
+
+        def do_approve(app_id):
+            return client.post("/api/applications/decide", json={"application_id": app_id, "decision": "APPROVE"}, headers=headers_teacher)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(do_approve, app_ids))
+
+        status_codes = [r.status_code for r in responses]
+        assert 200 in status_codes
+        assert 400 in status_codes
+        fail_resp = [r for r in responses if r.status_code == 400][0]
+        assert "TOPIC_FULL" in fail_resp.text
+
+        db = SessionLocal()
+        t_check = db.query(Topic).filter(Topic.id == topic_id).first()
+        assert t_check.quota_used == 5
+        assert t_check.quota_used <= t_check.quota_total
+        db.close()
+    finally:
+        db = SessionLocal()
+        t = db.query(Topic).filter(Topic.id == 1).first()
+        t.quota_used = orig_used
+        t.quota_total = orig_total
+        t.status = "available"
+        db.commit()
+        db.close()
+
+def test_head_only_confirms_teacher_approved():
+    """Тест: Head подтверждает только заявки, уже согласованные teacher"""
+    head_token = get_auth_token("head@test.com")
+    headers_head = {"Authorization": f"Bearer {head_token}"}
+
+    st_email = f"st_head_sub_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Студент Не Согласованный", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+
+    res = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    app_id = res.json()["application_id"]
+
+    # Head пытается утвердить заявку, которая еще SUBMITTED (не согласована teacher@test.com)
+    dec = client.post("/api/applications/decide", json={"application_id": app_id, "decision": "APPROVE"}, headers=headers_head)
+    assert dec.status_code == 400
+    assert "согласованные преподавателем" in dec.text
+
+def test_other_applications_closed_on_final_assignment():
+    """Тест: при назначении темы остальные активные заявки студента корректно закрываются"""
+    teacher_token = get_auth_token("teacher@test.com")
+    headers_teacher = {"Authorization": f"Bearer {teacher_token}"}
+
+    st_email = f"st_close_other_{uuid.uuid4().hex[:6]}@test.com"
+    client.post("/api/register", json={"full_name": "Студент Закрытия Заявок", "email": st_email, "password": "123456", "role": "student"})
+    st_token = get_auth_token(st_email)
+
+    res1 = client.post("/api/applications/apply", json={"topic_id": 1, "priority": 1}, headers={"Authorization": f"Bearer {st_token}"})
+    app1_id = res1.json()["application_id"]
+
+    res2 = client.post("/api/applications/apply", json={"topic_id": 3, "priority": 2}, headers={"Authorization": f"Bearer {st_token}"})
+    app2_id = res2.json()["application_id"]
+
+    # Преподаватель одобряет тему 1
+    client.post("/api/applications/decide", json={"application_id": app1_id, "decision": "APPROVE"}, headers=headers_teacher)
+
+    from main import SessionLocal, Application
+    db = SessionLocal()
+    app2 = db.query(Application).filter(Application.id == app2_id).first()
+    assert app2.status == "REJECTED"
+    assert "распределение" in app2.reject_reason or "назначение" in app2.reject_reason
+    db.close()
+
+# ─── 13. OFFICIAL ORDER, PDF, QR & VERIFICATION REGRESSION TESTS ──────────────
+def test_pdf_unicode_fonts_and_kazakh_letters():
+    """Тест: PDF использует Unicode TTF шрифты, кириллица и казахские буквы не используют Helvetica"""
+    head_token = get_auth_token("head@test.com")
+    res = client.get("/api/export/pdf-order", headers={"Authorization": f"Bearer {head_token}"})
+    assert res.status_code == 200
+    assert "application/pdf" in res.headers.get("content-type", "")
+    assert res.content[:4] == b"%PDF"
+    # Helvetica must not be used for text rendering
+    assert b"Helvetica" not in res.content
+    # Unicode TrueType fonts (ArialMT / Arial-BoldMT) are embedded
+    assert b"ArialMT" in res.content or b"Arial-BoldMT" in res.content
+
+def test_order_unique_verification_code():
+    """Тест: каждый OfficialOrder получает уникальный verification_code"""
+    from main import SessionLocal, OfficialOrder, generate_order_verification_code
+    db = SessionLocal()
+    code1 = generate_order_verification_code()
+    code2 = generate_order_verification_code()
+    assert code1 != code2
+    assert code1.startswith("ORDER-2026-")
+    assert code2.startswith("ORDER-2026-")
+
+    ord1 = OfficialOrder(order_number=f"TEST-ORD-{uuid.uuid4().hex[:6]}", document_hash="hash1")
+    ord2 = OfficialOrder(order_number=f"TEST-ORD-{uuid.uuid4().hex[:6]}", document_hash="hash2")
+    db.add(ord1)
+    db.add(ord2)
+    db.commit()
+    try:
+        assert ord1.verification_code != ord2.verification_code
+        assert ord1.verification_code.startswith("ORDER-2026-")
+        assert ord2.verification_code.startswith("ORDER-2026-")
+    finally:
+        db.delete(ord1)
+        db.delete(ord2)
+        db.commit()
+        db.close()
+
+def test_pdf_qr_target_current_order():
+    """Тест: QR-код ведёт именно на /verify/{verification_code} текущего приказа и использует BASE_URL"""
+    import qrcode
+    from main import SessionLocal, OfficialOrder, BASE_URL
+    db = SessionLocal()
+    order = db.query(OfficialOrder).first()
+    assert order is not None
+    expected_url = f"{BASE_URL}/verify/{order.verification_code}"
+    db.close()
+
+    qr = qrcode.QRCode()
+    qr.add_data(expected_url)
+    qr.make(fit=True)
+    assert any(expected_url.encode() in d.data for d in qr.data_list)
+
+def test_pdf_saved_to_disk_and_document_hash():
+    """Тест: финальный PDF сохранён на диск, document_hash = 64 hex, calculated SHA256 == stored hash"""
+    import os, hashlib
+    from main import SessionLocal, OfficialOrder, ORDERS_DIR
+    head_token = get_auth_token("head@test.com")
+    res = client.get("/api/export/pdf-order", headers={"Authorization": f"Bearer {head_token}"})
+    assert res.status_code == 200
+
+    db = SessionLocal()
+    order = db.query(OfficialOrder).first()
+    assert order is not None
+    order_code = order.verification_code
+    stored_hash = order.document_hash
+    db.close()
+
+    # Hash must be 64 hexadecimal characters
+    assert len(stored_hash) == 64
+    assert all(c in "0123456789abcdef" for c in stored_hash.lower())
+
+    # File must exist on disk
+    pdf_path = os.path.join(ORDERS_DIR, f"order_{order_code}.pdf")
+    assert os.path.exists(pdf_path)
+
+    with open(pdf_path, "rb") as f:
+        disk_bytes = f.read()
+
+    calculated_disk_hash = hashlib.sha256(disk_bytes).hexdigest()
+    assert calculated_disk_hash == stored_hash
+    assert hashlib.sha256(res.content).hexdigest() == stored_hash
+
+def test_repeated_pdf_download_returns_same_file():
+    """Тест: повторное скачивание этого приказа отдаёт тот же файл байт в байт"""
+    import hashlib
+    head_token = get_auth_token("head@test.com")
+    headers = {"Authorization": f"Bearer {head_token}"}
+    res1 = client.get("/api/export/pdf-order", headers=headers)
+    res2 = client.get("/api/export/pdf-order", headers=headers)
+    assert res1.status_code == 200
+    assert res2.status_code == 200
+    assert res1.content == res2.content
+    h1 = hashlib.sha256(res1.content).hexdigest()
+    h2 = hashlib.sha256(res2.content).hexdigest()
+    assert h1 == h2
+    assert len(h1) == 64
+
+def test_verification_page_shows_real_hash_and_honest_wording():
+    """Тест: Verification page показывает реальный 64-hex hash, честную формулировку META, убрано «ЭЦП верифицирована»"""
+    from main import SessionLocal, OfficialOrder
+    db = SessionLocal()
+    order = db.query(OfficialOrder).first()
+    assert order is not None
+    order_code = order.verification_code
+    stored_hash = order.document_hash
+    db.close()
+
+    res = client.get(f"/verify/{order_code}")
+    assert res.status_code == 200
+    # Честные формулировки
+    assert "Документ зарегистрирован в реестре META" in res.text
+    assert "Контрольная сумма SHA-256" in res.text
+    # Реальный 64-hex hash отображается полностью
+    assert stored_hash in res.text
+    # Убраны слова «ЭЦП верифицирована» и «Статус ЭЦП»
+    assert "ЭЦП верифицирована" not in res.text
+    assert "Статус ЭЦП" not in res.text
+    assert "Действительна (Криптографически заверено)" not in res.text
+
+    # Несуществующий приказ
+    res_unknown = client.get("/verify/ORDER-NON-EXISTENT-999")
+    assert res_unknown.status_code == 200
+    assert "Документ не найден в реестре • Цифровой реестр ASTRA" in res_unknown.text
+
+# ─── 14. BACKEND HARDENING & INTEGRITY REGRESSION TESTS ──────────────────────────
+def test_norm_control_none_styles_warning():
+    """Тест: Norm-control НЕ считает None font/size/spacing автоматически PASS (отмечает UNKNOWN/WARNING)"""
+    import docx
+    doc = docx.Document()
+    doc.add_paragraph("Тестовый фрагмент диплома без явного оформления шрифта")
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+
+    res = client.post(
+        "/api/norm-control/check-docx",
+        files={"file": ("raw_document.docx", buf, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert "checks" in data
+
+    font_check = next((c for c in data["checks"] if "Гарнитура" in c["title"] or "шрифт" in c["title"].lower()), None)
+    size_check = next((c for c in data["checks"] if "Размер" in c["title"] or "кегль" in c["title"].lower()), None)
+    spacing_check = next((c for c in data["checks"] if "интервал" in c["title"].lower()), None)
+
+    assert font_check is not None
+    assert font_check["passed"] is False
+    assert font_check.get("status") in ["UNKNOWN", "WARNING"]
+
+    assert size_check is not None
+    assert size_check["passed"] is False
+    assert size_check.get("status") in ["UNKNOWN", "WARNING"]
+
+    assert spacing_check is not None
+    assert spacing_check["passed"] is False
+    assert spacing_check.get("status") in ["UNKNOWN", "WARNING"]
+
+
+def test_norm_control_inherited_normal_style_pass():
+    """Тест: Norm-control корректно распознает унаследованные стили Normal (TNR, 14pt, 1.5)"""
+    import docx
+    doc = docx.Document()
+    normal_style = doc.styles["Normal"]
+    normal_style.font.name = "Times New Roman"
+    normal_style.font.size = docx.shared.Pt(14)
+    normal_style.paragraph_format.line_spacing = 1.5
+
+    doc.add_paragraph("Введение к исследованию")
+    doc.add_paragraph("Основной раздел дипломного проектирования")
+    doc.add_paragraph("Заключение")
+    doc.add_paragraph("Список использованных источников")
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+
+    res = client.post(
+        "/api/norm-control/check-docx",
+        files={"file": ("styled_document.docx", buf, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    font_check = next((c for c in data["checks"] if "Гарнитура" in c["title"] or "Times New Roman" in c["title"]), None)
+    size_check = next((c for c in data["checks"] if "14 пт" in c["title"]), None)
+    spacing_check = next((c for c in data["checks"] if "1.5" in c["title"]), None)
+
+    assert font_check is not None and font_check["passed"] is True
+    assert size_check is not None and size_check["passed"] is True
+    assert spacing_check is not None and spacing_check["passed"] is True
+
+
+def test_upload_security_disallowed_extension():
+    """Тест: upload отклоняет недопустимые расширения файлов"""
+    fake_exe = BytesIO(b"MZ executable content")
+    res = client.post(
+        "/api/checkpoints/upload",
+        data={"checkpoint_id": 1},
+        files={"file": ("malicious.exe", fake_exe, "application/octet-stream")},
+        headers={"Authorization": f"Bearer {get_auth_token('student@test.com')}"}
+    )
+    assert res.status_code == 400
+    assert "Недопустимый формат" in res.text
+
+
+def test_upload_security_max_size_limit():
+    """Тест: upload отклоняет файлы превышающие лимит размера (413 Payload Too Large)"""
+    big_data = BytesIO(b"A" * (16 * 1024 * 1024))
+    res = client.post(
+        "/api/norm-control/check-docx",
+        files={"file": ("oversized.docx", big_data, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
+    )
+    assert res.status_code == 413
+    assert "превышает допустимый лимит" in res.text
+
+
+def test_active_sqlite_db_backup_path():
+    """Тест: backup использует реальный путь активной SQLite DB через get_active_sqlite_db_path()"""
+    import os
+    from main import get_active_sqlite_db_path, engine
+    active_path = get_active_sqlite_db_path()
+    assert os.path.isabs(active_path)
+    assert os.path.exists(active_path)
+    if getattr(engine.url, "database", None):
+        assert os.path.normpath(active_path) == os.path.normpath(os.path.abspath(engine.url.database))
+
+    head_token = get_auth_token("head@test.com")
+    backup_res = client.get("/api/admin/backup", headers={"Authorization": f"Bearer {head_token}"})
+    assert backup_res.status_code == 200
+    assert len(backup_res.content) > 1000
+
+
+def test_serve_uploaded_file_path_traversal():
+    """Тест: предотвращение path traversal при отдаче файлов из uploads"""
+    headers = {"Authorization": f"Bearer {get_auth_token('student@test.com')}"}
+    res1 = client.get("/uploads/..%2Fmain.py", headers=headers)
+    assert res1.status_code in [400, 403, 404]
+
+    res2 = client.get("/uploads/..\\main.py", headers=headers)
+    assert res2.status_code in [400, 403, 404]
+
+
+

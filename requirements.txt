@@ -1,0 +1,10 @@
+fastapi>=0.121.0
+uvicorn[standard]>=0.23.0
+sqlalchemy>=2.0.0
+python-multipart>=0.0.6
+python-docx>=1.1.0
+qrcode[pil]>=7.4.2
+reportlab>=4.0.0
+websockets>=11.0.0
+pytest>=7.4.0
+httpx>=0.25.0

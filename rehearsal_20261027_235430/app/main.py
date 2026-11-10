@@ -1,0 +1,4558 @@
+import hashlib
+import os
+import csv
+import re
+import json
+import secrets
+import shutil
+import asyncio
+import sqlite3
+import tempfile
+import zipfile
+import time
+from html import escape
+from functools import lru_cache
+from pathlib import Path
+from io import StringIO, BytesIO
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+from difflib import SequenceMatcher
+from contextlib import asynccontextmanager
+
+from fastapi import (
+    FastAPI, HTTPException, Depends, Request, WebSocket,
+    WebSocketDisconnect, UploadFile, File, Form, Header, Query, status
+)
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
+from starlette.requests import HTTPConnection
+from starlette.background import BackgroundTask
+from sqlalchemy.exc import IntegrityError, OperationalError
+
+import docx
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+import qrcode
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, KeepTogether
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.pdfmetrics import registerFontFamily
+from reportlab.pdfgen import canvas
+
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Boolean,
+    ForeignKey, DateTime, Text, func, Index, text, UniqueConstraint, CheckConstraint, event
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
+
+# ─── Configuration & Database setup ───────────────────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./diploma.db")
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
+UPLOADS_DIR = os.path.abspath(os.environ.get("UPLOADS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")))
+ORDERS_DIR = os.path.join(UPLOADS_DIR, "orders")
+ASSIGNED_STATUSES = ("APPROVED", "SUPERVISOR_APPROVED", "CONFIRMED_BY_HEAD", "ALLOCATED")
+CORS_ORIGINS = [x.strip().rstrip("/") for x in os.environ.get("CORS_ALLOWED_ORIGINS", BASE_URL).split(",") if x.strip()]
+if "*" in CORS_ORIGINS:
+    raise RuntimeError("CORS_ALLOWED_ORIGINS must contain explicit origins")
+os.makedirs(ORDERS_DIR, exist_ok=True)
+
+_FONTS_INITIALIZED = False
+PDF_FONT_REGULAR = "UnicodeFont"
+PDF_FONT_BOLD = "UnicodeFont-Bold"
+
+def init_pdf_fonts():
+    global _FONTS_INITIALIZED, PDF_FONT_REGULAR, PDF_FONT_BOLD
+    if _FONTS_INITIALIZED:
+        return (PDF_FONT_REGULAR, PDF_FONT_BOLD)
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    reg_candidates = [
+        os.path.join(base_dir, "fonts", "Arial.ttf"),
+        os.path.join(base_dir, "fonts", "DejaVuSans.ttf"),
+        "fonts/Arial.ttf",
+        "fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ]
+    bold_candidates = [
+        os.path.join(base_dir, "fonts", "Arial-Bold.ttf"),
+        os.path.join(base_dir, "fonts", "DejaVuSans-Bold.ttf"),
+        "fonts/Arial-Bold.ttf",
+        "fonts/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+    ]
+    reg_path = next((p for p in reg_candidates if os.path.exists(p)), None)
+    bold_path = next((p for p in bold_candidates if os.path.exists(p)), None)
+
+    if reg_path:
+        pdfmetrics.registerFont(TTFont("UnicodeFont", reg_path))
+        if bold_path:
+            pdfmetrics.registerFont(TTFont("UnicodeFont-Bold", bold_path))
+        else:
+            pdfmetrics.registerFont(TTFont("UnicodeFont-Bold", reg_path))
+        registerFontFamily(
+            "UnicodeFont",
+            normal="UnicodeFont",
+            bold="UnicodeFont-Bold",
+            italic="UnicodeFont",
+            boldItalic="UnicodeFont-Bold"
+        )
+        PDF_FONT_REGULAR = "UnicodeFont"
+        PDF_FONT_BOLD = "UnicodeFont-Bold"
+        _FONTS_INITIALIZED = True
+    else:
+        PDF_FONT_REGULAR = "Helvetica"
+        PDF_FONT_BOLD = "Helvetica-Bold"
+    return (PDF_FONT_REGULAR, PDF_FONT_BOLD)
+
+class UnicodeCanvas(canvas.Canvas):
+    def __init__(self, *args, **kwargs):
+        font_reg, _ = init_pdf_fonts()
+        kwargs["initialFontName"] = font_reg
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        num_pages = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            font_reg, _ = init_pdf_fonts()
+            self.saveState()
+            self.setFont(font_reg, 7.5)
+            self.setFillColor(colors.HexColor('#64748b'))
+            self.drawRightString(A4[0] - 36, 18, f"Бет / Стр. {self._pageNumber} / {num_pages}")
+            self.restoreState()
+            canvas.Canvas.showPage(self)
+        canvas.Canvas.save(self)
+
+def generate_order_verification_code() -> str:
+    return f"ORDER-2026-{secrets.token_hex(4).upper()}"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+if getattr(engine.url, "database", None):
+    _db_dir = os.path.dirname(os.path.abspath(engine.url.database))
+    if _db_dir:
+        os.makedirs(_db_dir, exist_ok=True)
+
+def get_active_sqlite_db_path() -> str:
+    """Возвращает абсолютный путь к активной SQLite базе данных на основе engine.url"""
+    db_path = getattr(engine.url, "database", None)
+    if db_path:
+        return os.path.abspath(db_path)
+    return os.path.abspath("diploma.db")
+
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# ─── Password Hashing (hashlib PBKDF2 HMAC, Random Salt, 100k Iterations, NO passlib) ─
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    iterations = 100_000
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations)
+    return f"pbkdf2:sha256:{iterations}${salt}${derived.hex()}"
+
+def verify_password(plain: str, hashed: str) -> bool:
+    if not hashed or not plain:
+        return False
+    if hashed.startswith("pbkdf2:sha256:"):
+        try:
+            parts = hashed.split("$")
+            iter_part = parts[0].split(":")[-1]
+            iterations = int(iter_part)
+            salt = parts[1]
+            key_hex = parts[2]
+            check = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt.encode("utf-8"), iterations)
+            return secrets.compare_digest(check.hex(), key_hex)
+        except Exception:
+            return False
+    # Legacy SHA-256 fallback (support for existing test DB hashes)
+    legacy_salt = "diploma_vtipo_secret_salt_2026"
+    legacy_hash = hashlib.sha256((plain + legacy_salt).encode("utf-8")).hexdigest()
+    if secrets.compare_digest(legacy_hash, hashed):
+        return True
+    plain_hash = hashlib.sha256(plain.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(plain_hash, hashed)
+
+@lru_cache(maxsize=128)
+def has_demo_password(password_hash: str) -> bool:
+    return verify_password("123456", password_hash)
+
+
+def privileged_credentials_allowed(user) -> bool:
+    return (user.role not in ("teacher", "head", "admin", "company") or
+            os.environ.get("META_SEED_DEMO") == "1" or not has_demo_password(user.password_hash))
+
+
+# ─── Models ───────────────────────────────────────────────────────────────────
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (
+        Index("idx_users_email", "email"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False)  # "student", "teacher", "head", "admin", "company"
+    student_number = Column(String, nullable=True)
+    group_name = Column(String, nullable=True)
+    gpa = Column(Float, default=3.5)
+    rating = Column(Float, default=3.5)  # Backwards compatibility alias
+    department = Column(String, default="ВТиПО")
+    skills = Column(String, default="")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    sessions = relationship("SessionModel", back_populates="user", cascade="all, delete-orphan")
+
+class SessionModel(Base):
+    __tablename__ = "sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    token = Column(String(128), unique=True, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+
+    user = relationship("User", back_populates="sessions")
+
+class Topic(Base):
+    __tablename__ = "topics"
+    __table_args__ = (
+        Index("idx_topics_title", "title"),
+        Index("idx_topics_department", "department"),
+        CheckConstraint("quota_total > 0 AND quota_used >= 0 AND quota_used <= quota_total", name="ck_topic_quota"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)  # compatibility (mirrors title_ru)
+    title_ru = Column(String, index=True, nullable=True)
+    title_kz = Column(String, nullable=True)
+    title_en = Column(String, nullable=True)
+    supervisor_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    supervisor_name = Column(String, nullable=True)
+    department = Column(String, default="ВТиПО", index=True)
+    category = Column(String, default="WEB")  # WEB, AI_ML, IOT, NETWORKS, CYBERSECURITY, INDUSTRIAL
+    tags = Column(String, default="")
+    required_skills = Column(String, default="")
+    difficulty = Column(Integer, default=3)
+    has_data = Column(Boolean, default=True)
+    quota_total = Column(Integer, default=5)
+    quota_used = Column(Integer, default=0)
+    status = Column(String, default="available")  # "available" or "full"
+    academic_year = Column(String, default="2026-2027")
+    work_type = Column(String, default="DIPLOMA")  # "DIPLOMA", "COURSEWORK"
+    source = Column(String, default="teacher")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    supervisor = relationship("User", foreign_keys=[supervisor_id])
+
+class Application(Base):
+    __tablename__ = "applications"
+    __table_args__ = (
+        UniqueConstraint("student_id", "topic_id", name="uq_applications_student_topic"),
+        Index("uq_application_assigned_student", "student_id", unique=True,
+              sqlite_where=text("status IN ('APPROVED','SUPERVISOR_APPROVED','CONFIRMED_BY_HEAD','ALLOCATED')")),
+        Index("uq_application_active_priority", "student_id", "priority", unique=True,
+              sqlite_where=text("status != 'REJECTED'")),
+        Index("uq_application_custom_topic", "student_id", "custom_topic_id", unique=True,
+              sqlite_where=text("custom_topic_id IS NOT NULL")),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    topic_id = Column(Integer, ForeignKey("topics.id"), nullable=True, index=True)
+    custom_topic_id = Column(Integer, ForeignKey("custom_topic_proposals.id"), nullable=True, index=True)
+    priority = Column(Integer, default=1)  # 1, 2, 3
+    custom_title = Column(String, nullable=True)
+    motivation = Column(Text, default="")
+    status = Column(String, default="SUBMITTED")  # SUBMITTED, APPROVED, SUPERVISOR_APPROVED, REJECTED, CONFIRMED_BY_HEAD, ALLOCATED
+    reject_reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    student = relationship("User", foreign_keys=[student_id])
+    topic = relationship("Topic", foreign_keys=[topic_id])
+    custom_topic = relationship("CustomTopicProposal", foreign_keys=[custom_topic_id])
+    checkpoints = relationship("Checkpoint", back_populates="application", cascade="all, delete-orphan")
+
+class CustomTopicProposal(Base):
+    __tablename__ = "custom_topic_proposals"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title_raw = Column(String, nullable=False)
+    title_ru = Column(String, nullable=True)
+    title_kz = Column(String, nullable=True)
+    title_en = Column(String, nullable=True)
+    supervisor_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    category = Column(String, default="WEB")
+    difficulty = Column(Integer, default=3)
+    duplicate_score = Column(Float, default=0.0)
+    status = Column(String, default="PROPOSED")  # DRAFT, PROPOSED, SUPERVISOR_APPROVED, HEAD_APPROVED, REJECTED
+    supervisor_comment = Column(Text, nullable=True)
+    head_comment = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    student = relationship("User", foreign_keys=[student_id])
+    supervisor = relationship("User", foreign_keys=[supervisor_id])
+
+class Preference(Base):
+    __tablename__ = "preferences"
+    __table_args__ = (
+        UniqueConstraint("student_id", "priority", name="uq_preferences_student_priority"),
+        UniqueConstraint("student_id", "topic_id", name="uq_preferences_student_topic"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    topic_id = Column(Integer, ForeignKey("topics.id"), index=True, nullable=False)
+    priority = Column(Integer, default=1)
+    rank = Column(Integer, default=1)  # 1 = top priority, 2, 3...
+
+    student = relationship("User")
+    topic = relationship("Topic")
+
+    def __init__(self, **kwargs):
+        if "priority" in kwargs and "rank" not in kwargs:
+            kwargs["rank"] = kwargs["priority"]
+        elif "rank" in kwargs and "priority" not in kwargs:
+            kwargs["priority"] = kwargs["rank"]
+        super().__init__(**kwargs)
+
+class Checkpoint(Base):
+    __tablename__ = "checkpoints"
+    __table_args__ = (UniqueConstraint("student_id", "stage", name="uq_checkpoint_student_stage"),)
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    application_id = Column(Integer, ForeignKey("applications.id"), nullable=True)
+    stage = Column(Integer, nullable=True)  # 25, 50, 75, 100
+    title = Column(String)
+    deadline = Column(String)
+    file_name = Column(String, nullable=True)
+    status = Column(String, default="NOT_SUBMITTED")  # NOT_SUBMITTED, UNDER_REVIEW, ACCEPTED, REVISION
+    review_comment = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    student = relationship("User", foreign_keys=[student_id])
+    application = relationship("Application", back_populates="checkpoints")
+    submissions = relationship("CheckpointSubmission", back_populates="checkpoint", cascade="all, delete-orphan")
+
+class CheckpointSubmission(Base):
+    __tablename__ = "checkpoint_submissions"
+    __table_args__ = (UniqueConstraint("checkpoint_id", "version", name="uq_checkpoint_version"),)
+    id = Column(Integer, primary_key=True, index=True)
+    checkpoint_id = Column(Integer, ForeignKey("checkpoints.id"), nullable=False, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    file_name = Column(String, nullable=False)
+    file_path = Column(String, nullable=False)
+    version = Column(Integer, default=1)
+    submitted_at = Column(DateTime, default=datetime.utcnow)
+    status = Column(String, default="UNDER_REVIEW")
+    review_comment = Column(Text, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+
+    checkpoint = relationship("Checkpoint", back_populates="submissions")
+    student = relationship("User", foreign_keys=[student_id])
+    reviewer = relationship("User", foreign_keys=[reviewed_by])
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String, nullable=False)
+    message = Column(Text, nullable=False)
+    type = Column(String, default="info")  # info, success, warning, error
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
+class OfficialOrder(Base):
+    __tablename__ = "official_orders"
+    id = Column(Integer, primary_key=True, index=True)
+    order_number = Column(String, unique=True, index=True, nullable=False)
+    academic_year = Column(String, default="2026-2027")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    status = Column(String, default="SIGNED")  # DRAFT, SIGNED, ACTIVE
+    verification_code = Column(String, unique=True, index=True, nullable=False, default=generate_order_verification_code)
+    document_hash = Column(String, nullable=False)
+
+    creator = relationship("User", foreign_keys=[created_by])
+    items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
+
+@event.listens_for(OfficialOrder, "before_insert")
+def set_unique_order_verification_code(mapper, connection, target):
+    if not target.verification_code:
+        target.verification_code = generate_order_verification_code()
+
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+    __table_args__ = (UniqueConstraint("order_id", "student_id", name="uq_order_student"),)
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("official_orders.id"), nullable=False, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    topic_id = Column(Integer, ForeignKey("topics.id"), nullable=True)
+    supervisor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    student_name = Column(String, nullable=False)
+    group_name = Column(String, nullable=True)
+    topic_title_ru = Column(String, nullable=False)
+    topic_title_kz = Column(String, nullable=True)
+    supervisor_name = Column(String, nullable=False)
+
+    order = relationship("OfficialOrder", back_populates="items")
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=True)
+    user_email = Column(String, nullable=True)
+    action = Column(String)  # LOGIN, APPLY, APPROVE, REJECT, AUTO_DISTRIBUTE, CONFIRM_ALL, BACKUP_CREATED, etc.
+    details = Column(Text)
+    ip_address = Column(String, default="127.0.0.1")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# ─── Pydantic Schemas ─────────────────────────────────────────────────────────
+class RegisterSchema(BaseModel):
+    full_name: str = Field(min_length=1, max_length=200)
+    email: str = Field(min_length=3, max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+    password: str = Field(min_length=6, max_length=1024)
+    role: str = "student"
+    rating: Optional[float] = Field(default=3.5, ge=0, le=4, allow_inf_nan=False)
+    gpa: Optional[float] = Field(default=None, ge=0, le=4, allow_inf_nan=False)
+    group_name: Optional[str] = None
+    student_number: Optional[str] = None
+    skills: Optional[str] = ""
+
+class LoginSchema(BaseModel):
+    email: str = Field(min_length=1, max_length=254)
+    password: str = Field(min_length=1, max_length=1024)
+
+class ApplicationApplySchema(BaseModel):
+    student_id: Optional[int] = None
+    topic_id: Optional[int] = None
+    custom_topic_id: Optional[int] = None
+    priority: int = 1
+    custom_title: Optional[str] = None
+    motivation: Optional[str] = ""
+
+class ApplicationDecideSchema(BaseModel):
+    application_id: int
+    decision: str  # "APPROVE" or "REJECT"
+    reason: Optional[str] = None
+    decided_by_id: Optional[int] = None
+
+class PreferencesSchema(BaseModel):
+    student_id: int
+    topic_ids: List[int]
+
+class CompanyTopicSchema(BaseModel):
+    company_id: int
+    title: str
+    supervisor_name: str
+    department: str = "Индустриальные проекты"
+    tags: str = "Industry, Web"
+    required_skills: str = "Git, SQL"
+    difficulty: int = Field(default=3, ge=1, le=5)
+    has_data: bool = True
+    quota_total: int = Field(default=3, ge=1, le=1000)
+
+class CheckpointDoneSchema(BaseModel):
+    checkpoint_id: int
+
+class CheckpointReviewSchema(BaseModel):
+    checkpoint_id: int
+    status: str  # "ACCEPTED" | "REVISION"
+    comment: Optional[str] = ""
+
+class AiRefineSchema(BaseModel):
+    raw_idea: str
+
+class TopicCheckSchema(BaseModel):
+    title: str
+
+class CustomTopicCreateSchema(BaseModel):
+    title_raw: str = Field(min_length=1, max_length=2000)
+    title_ru: Optional[str] = None
+    title_kz: Optional[str] = None
+    title_en: Optional[str] = None
+    supervisor_id: Optional[int] = None
+    category: str = "WEB"
+    difficulty: int = 3
+
+class CustomTopicSupervisorDecisionSchema(BaseModel):
+    status: str  # "SUPERVISOR_APPROVED" or "REJECTED"
+    comment: Optional[str] = None
+
+class CustomTopicHeadDecisionSchema(BaseModel):
+    status: str  # "HEAD_APPROVED" or "REJECTED"
+    comment: Optional[str] = None
+    quota_total: int = Field(default=5, ge=1, le=1000)
+
+class GaleShapleyRunSchema(BaseModel):
+    dry_run: bool = False
+    apply: bool = False
+
+# ─── WebSocket Connection Manager ─────────────────────────────────────────────
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[int, List[WebSocket]] = {}
+
+    async def connect(self, user_id: int, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.setdefault(user_id, []).append(websocket)
+
+    def disconnect(self, user_id: int, websocket: WebSocket):
+        if user_id in self.active_connections:
+            self.active_connections[user_id] = [ws for ws in self.active_connections[user_id] if ws != websocket]
+            if not self.active_connections[user_id]:
+                del self.active_connections[user_id]
+
+    async def send_to_user(self, user_id: int, message: dict):
+        if user_id in self.active_connections:
+            for ws in list(self.active_connections[user_id]):
+                try:
+                    if not websocket_session_valid(ws.state.auth_token, user_id):
+                        await ws.close(code=1008, reason="Session revoked or expired")
+                        self.disconnect(user_id, ws)
+                        continue
+                    await ws.send_text(json.dumps(message, ensure_ascii=False))
+                except (WebSocketDisconnect, RuntimeError, OSError):
+                    self.disconnect(user_id, ws)
+
+    async def broadcast(self, message: dict):
+        for user_id, sockets in list(self.active_connections.items()):
+            for ws in list(sockets):
+                try:
+                    if not websocket_session_valid(ws.state.auth_token, user_id):
+                        await ws.close(code=1008, reason="Session revoked or expired")
+                        self.disconnect(user_id, ws)
+                        continue
+                    await ws.send_text(json.dumps(message, ensure_ascii=False))
+                except (WebSocketDisconnect, RuntimeError, OSError):
+                    self.disconnect(user_id, ws)
+
+ws_manager = ConnectionManager()
+
+# ─── Database Session & Dependencies ──────────────────────────────────────────
+def get_db(connection: HTTPConnection):
+    db = SessionLocal()
+    try:
+        # SQLite serializes writers before any authorization/business reads.
+        # This also works across processes; an in-memory Python lock would not.
+        if (connection.scope.get("method") in ("POST", "PUT", "PATCH", "DELETE") or connection.url.path.startswith(("/api/checkpoints", "/api/export"))) and connection.url.path != "/api/admin/restore":
+            db.execute(text("BEGIN IMMEDIATE"))
+        yield db
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Конфликт целостности данных") from exc
+    except OperationalError as exc:
+        db.rollback()
+        if "locked" in str(exc).lower():
+            raise HTTPException(status_code=409, detail="Данные изменяются другим запросом; повторите запрос") from exc
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+def log_audit(db: Session, user_id: Optional[int], action: str, details: str, user_email: Optional[str] = None, ip_address: Optional[str] = "127.0.0.1"):
+    user = db.get(User, user_id) if user_id and not user_email else None
+    db.add(AuditLog(user_id=user_id, user_email=user_email or (user.email if user else "система"),
+                    action=action, details=details, ip_address=ip_address or "127.0.0.1"))
+    db.flush()
+
+
+def create_notification(db: Session, user_id: int, title: str, message: str, n_type: str = "info"):
+    db.add(Notification(user_id=user_id, title=title, message=message, type=n_type, is_read=False))
+    db.flush()
+
+
+def require_student_access(db: Session, current_user: User, student_id: int):
+    student = db.get(User, student_id)
+    if not student or student.role != "student":
+        raise HTTPException(status_code=404, detail="Студент не найден")
+    if current_user.role in ("head", "admin") or (current_user.role == "student" and current_user.id == student_id):
+        return
+    if current_user.role == "teacher":
+        owned = db.query(Application).join(Topic, Application.topic_id == Topic.id).filter(
+            Application.student_id == student_id, Application.status.in_(ASSIGNED_STATUSES),
+            Topic.supervisor_id == current_user.id).first()
+        if owned:
+            return
+    raise HTTPException(status_code=403, detail="Доступ к данным другого студента запрещен")
+
+
+def require_checkpoint_access(db: Session, current_user: User, checkpoint: Checkpoint):
+    if not checkpoint:
+        raise HTTPException(status_code=404, detail="Контрольная точка не найдена")
+    student_id = checkpoint.student_id or (checkpoint.application.student_id if checkpoint.application else None)
+    if not student_id:
+        raise HTTPException(status_code=403, detail="Контрольная точка не привязана к студенту")
+    require_student_access(db, current_user, student_id)
+    return student_id
+
+
+async def send_workflow_event(db: Session, student_id: int, supervisor_id: Optional[int], message: dict):
+    recipients = {student_id} | {u.id for u in db.query(User).filter(User.role.in_(("head", "admin")), User.is_active.is_(True))}
+    if supervisor_id:
+        recipients.add(supervisor_id)
+    for user_id in recipients:
+        await ws_manager.send_to_user(user_id, message)
+
+
+def safe_upload_path(path: str) -> str:
+    candidate = os.path.realpath(path)
+    if os.path.commonpath([candidate, os.path.realpath(UPLOADS_DIR)]) != os.path.realpath(UPLOADS_DIR):
+        raise HTTPException(status_code=403, detail="Доступ запрещен")
+    return candidate
+
+
+def validate_docx_archive(content: bytes):
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as archive:
+            members = archive.infolist()
+            if len(members) > 2048 or sum(m.file_size for m in members) > 64 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Распакованный документ превышает допустимый лимит")
+            names = {m.filename for m in members}
+            if not {"[Content_Types].xml", "word/document.xml"}.issubset(names):
+                raise HTTPException(status_code=400, detail="Поврежденный документ DOCX")
+            if any(m.flag_bits & 1 for m in members):
+                raise HTTPException(status_code=400, detail="Зашифрованный документ не поддерживается")
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Поврежденный документ DOCX") from exc
+
+# ─── Server-Side Session Auth ─────────────────────────────────────────────────
+security_bearer = HTTPBearer(auto_error=False)
+
+def create_user_session(db: Session, user_id: int, days_valid: int = 7) -> str:
+    token = secrets.token_urlsafe(32)
+    session_obj = SessionModel(
+        user_id=user_id,
+        token=token,
+        created_at=datetime.utcnow(),
+        expires_at=datetime.utcnow() + timedelta(days=days_valid)
+    )
+    db.add(session_obj)
+    db.flush()
+    return token
+
+def get_current_user_optional(
+    auth: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
+    request: Request = None,
+    db: Session = Depends(get_db, scope="function")
+) -> Optional[User]:
+    token = None
+    if auth and auth.credentials:
+        token = auth.credentials.strip()
+    elif request:
+        auth_hdr = request.headers.get("Authorization")
+        if auth_hdr and auth_hdr.startswith("Bearer "):
+            token = auth_hdr[7:].strip()
+    
+    if not token:
+        return None
+
+    sess = db.query(SessionModel).filter(
+        SessionModel.token == token
+    ).first()
+
+    if not sess:
+        return None
+
+    now = datetime.utcnow()
+    if not sess.expires_at or sess.expires_at <= now:
+        return None
+
+    if not sess.user or not sess.user.is_active or not privileged_credentials_allowed(sess.user):
+        return None
+    return sess.user
+
+def get_current_user(
+    current_user: Optional[User] = Depends(get_current_user_optional)
+) -> User:
+    if not current_user:
+        raise HTTPException(
+            status_code=401,
+            detail="Требуется авторизация (Сессия недействительна или истекла)",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    return current_user
+
+def require_role(*allowed_roles: str):
+    def role_checker(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Недостаточно прав. Требуется роль: {', '.join(allowed_roles)}"
+            )
+        return current_user
+    return role_checker
+
+# ─── Lifespan Context & Database Migration ────────────────────────────────────
+DEFAULT_CHECKPOINT_STAGES = [
+    (25, "25% — Аналитический обзор и ТЗ", "15.12.2026"),
+    (50, "50% — Проектирование архитектуры и схемы БД", "15.02.2027"),
+    (75, "75% — Программная реализация и тестирование", "15.04.2027"),
+    (100, "100% — Полный текст ВКР и проверка на плагиат", "15.05.2027"),
+]
+
+def ensure_student_checkpoints(db: Session, student_id: int):
+    existing = db.query(Checkpoint).filter(Checkpoint.student_id == student_id).all()
+    existing_stages = {c.stage for c in existing if c.stage is not None}
+    for stage_val, title, deadline in DEFAULT_CHECKPOINT_STAGES:
+        if stage_val not in existing_stages:
+            cp = Checkpoint(
+                student_id=student_id,
+                stage=stage_val,
+                title=title,
+                deadline=deadline,
+                file_name=None,
+                status="NOT_SUBMITTED",
+                review_comment=None,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(cp)
+    db.flush()
+
+def create_default_checkpoints(db: Session, app_id: int):
+    app_obj = db.query(Application).filter(Application.id == app_id).first()
+    if app_obj and app_obj.student_id:
+        ensure_student_checkpoints(db, app_obj.student_id)
+
+def migrate_database():
+    """Безопасная неразрушающая SQLite миграция схемы и колонок с гарантией целостности FK и UNIQUE"""
+    os.makedirs("uploads/checkpoints", exist_ok=True)
+    os.makedirs("backups", exist_ok=True)
+    Base.metadata.create_all(bind=engine)
+
+    # 1. Базовые добавления колонок
+    with engine.connect() as conn:
+        def get_existing_cols(table_name):
+            try:
+                res = conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+                return {row[1] for row in res}
+            except Exception:
+                raise
+
+        # users
+        u_cols = get_existing_cols("users")
+        add_users = [
+            ("student_number", "VARCHAR"),
+            ("group_name", "VARCHAR"),
+            ("gpa", "FLOAT DEFAULT 3.5"),
+            ("department", "VARCHAR DEFAULT 'ВТиПО'"),
+            ("is_active", "BOOLEAN DEFAULT 1"),
+            ("created_at", "DATETIME")
+        ]
+        for col, col_type in add_users:
+            if col not in u_cols:
+                try:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {col_type}"))
+                except Exception:
+                    raise
+
+        # topics
+        t_cols = get_existing_cols("topics")
+        add_topics = [
+            ("title_ru", "VARCHAR"),
+            ("title_kz", "VARCHAR"),
+            ("title_en", "VARCHAR"),
+            ("supervisor_id", "INTEGER"),
+            ("category", "VARCHAR DEFAULT 'WEB'"),
+            ("academic_year", "VARCHAR DEFAULT '2026-2027'"),
+            ("work_type", "VARCHAR DEFAULT 'DIPLOMA'"),
+            ("created_at", "DATETIME")
+        ]
+        for col, col_type in add_topics:
+            if col not in t_cols:
+                try:
+                    conn.execute(text(f"ALTER TABLE topics ADD COLUMN {col} {col_type}"))
+                except Exception:
+                    raise
+
+        # applications
+        a_cols = get_existing_cols("applications")
+        add_apps = [
+            ("custom_topic_id", "INTEGER"),
+            ("priority", "INTEGER DEFAULT 1")
+        ]
+        for col, col_type in add_apps:
+            if col not in a_cols:
+                try:
+                    conn.execute(text(f"ALTER TABLE applications ADD COLUMN {col} {col_type}"))
+                except Exception:
+                    raise
+
+        # checkpoints
+        c_cols = get_existing_cols("checkpoints")
+        add_checkpoints = [
+            ("student_id", "INTEGER"),
+            ("stage", "INTEGER"),
+            ("file_name", "VARCHAR"),
+            ("review_comment", "TEXT"),
+            ("created_at", "DATETIME"),
+            ("updated_at", "DATETIME")
+        ]
+        for col, col_type in add_checkpoints:
+            if col not in c_cols:
+                try:
+                    conn.execute(text(f"ALTER TABLE checkpoints ADD COLUMN {col} {col_type}"))
+                except Exception:
+                    raise
+
+        # audit_logs
+        al_cols = get_existing_cols("audit_logs")
+        add_audit = [
+            ("user_email", "VARCHAR"),
+            ("ip_address", "VARCHAR DEFAULT '127.0.0.1'")
+        ]
+        for col, col_type in add_audit:
+            if col not in al_cols:
+                try:
+                    conn.execute(text(f"ALTER TABLE audit_logs ADD COLUMN {col} {col_type}"))
+                except Exception:
+                    raise
+
+        conn.commit()
+
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            fks = conn.execute(text(f'PRAGMA foreign_key_list("{table.name}")')).fetchall()
+            required = {(fk.parent.name, fk.column.table.name, fk.column.name) for fk in table.foreign_keys}
+            if not required.issubset({(fk[3], fk[2], fk[4]) for fk in fks}):
+                raise RuntimeError(f"Missing foreign keys in {table.name}; offline reviewed migration required")
+        if conn.execute(text("PRAGMA foreign_key_check")).fetchone():
+            raise RuntimeError("Legacy foreign key violations; data repair required")
+        # Existing duplicate data must be reviewed, never silently discarded.
+        definitions = (
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_application_assigned_student ON applications(student_id) WHERE status IN ('APPROVED','SUPERVISOR_APPROVED','CONFIRMED_BY_HEAD','ALLOCATED')",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_application_active_priority ON applications(student_id, priority) WHERE status != 'REJECTED'",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_student_topic ON applications(student_id, topic_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_application_custom_topic ON applications(student_id, custom_topic_id) WHERE custom_topic_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_checkpoint_version ON checkpoint_submissions(checkpoint_id, version)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_checkpoint_student_stage ON checkpoints(student_id, stage)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_order_student ON order_items(order_id, student_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_preferences_student_priority ON preferences(student_id, priority)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_preferences_student_topic ON preferences(student_id, topic_id)",
+        )
+        for statement in definitions:
+            conn.execute(text(statement))
+
+
+def seed_database(db: Session):
+    # Idempotent users seeding
+    test_users = [
+        {
+            "email": "student@test.com",
+            "full_name": "Ерасыл Кулажан",
+            "password": "123456",
+            "role": "student",
+            "gpa": 3.85,
+            "group_name": "ВТиПО-22-1",
+            "student_number": "22B030001",
+            "department": "ВТиПО",
+            "skills": "Python, Vue.js, FastAPI, PostgreSQL",
+            "is_active": True
+        },
+        {
+            "email": "teacher@test.com",
+            "full_name": "Доц. Ахметов К.А.",
+            "password": "123456",
+            "role": "teacher",
+            "gpa": 5.0,
+            "group_name": None,
+            "student_number": None,
+            "department": "ВТиПО",
+            "skills": "Web-технологии, Архитектура ПО",
+            "is_active": True
+        },
+        {
+            "email": "head@test.com",
+            "full_name": "Проф. Касымов А.Б.",
+            "password": "123456",
+            "role": "head",
+            "gpa": 5.0,
+            "group_name": None,
+            "student_number": None,
+            "department": "ВТиПО",
+            "skills": "Искусственный интеллект, Управление кафедрой",
+            "is_active": True
+        },
+        {
+            "email": "admin@test.com",
+            "full_name": "Администратор Системы",
+            "password": "123456",
+            "role": "admin",
+            "gpa": 5.0,
+            "group_name": None,
+            "student_number": None,
+            "department": "ВТиПО",
+            "skills": "DevOps, Администрирование",
+            "is_active": True
+        },
+        {
+            "email": "student2@test.com",
+            "full_name": "Айгерим Смагулова",
+            "password": "123456",
+            "role": "student",
+            "gpa": 3.92,
+            "group_name": "ВТиПО-22-1",
+            "student_number": "22B030002",
+            "department": "ВТиПО",
+            "skills": "PyTorch, OpenCV, Computer Vision, Python",
+            "is_active": True
+        },
+        {
+            "email": "student3@test.com",
+            "full_name": "Нурсултан Болатов",
+            "password": "123456",
+            "role": "student",
+            "gpa": 3.45,
+            "group_name": "ВТиПО-22-2",
+            "student_number": "22B030003",
+            "department": "ВТиПО",
+            "skills": "Arduino, C++, ESP32, MQTT, IoT",
+            "is_active": True
+        },
+        {
+            "email": "student4@test.com",
+            "full_name": "Динара Каримова",
+            "password": "123456",
+            "role": "student",
+            "gpa": 3.70,
+            "group_name": "ВТиПО-22-2",
+            "student_number": "22B030004",
+            "department": "ВТиПО",
+            "skills": "Linux, Wireshark, Cryptography, Python",
+            "is_active": True
+        },
+        {
+            "email": "company@test.com",
+            "full_name": "ТОО ТехноСервис",
+            "password": "123456",
+            "role": "company",
+            "gpa": 4.8,
+            "group_name": None,
+            "student_number": None,
+            "department": "Индустриальные проекты",
+            "skills": "Финтех, Индустриальная разработка",
+            "is_active": True
+        }
+    ]
+
+    for u_data in test_users:
+        user = db.query(User).filter(User.email == u_data["email"]).first()
+        if not user:
+            user = User(
+                email=u_data["email"],
+                full_name=u_data["full_name"],
+                password_hash=hash_password(u_data["password"]),
+                role=u_data["role"],
+                gpa=u_data["gpa"],
+                rating=u_data["gpa"],
+                group_name=u_data["group_name"],
+                student_number=u_data["student_number"],
+                department=u_data["department"],
+                skills=u_data["skills"],
+                is_active=u_data["is_active"],
+                created_at=datetime.utcnow()
+            )
+            db.add(user)
+        else:
+            # Existing credentials and disabled state are never reset by seeding.
+            if user.gpa is None:
+                user.gpa = u_data["gpa"]
+            if user.rating is None:
+                user.rating = u_data["gpa"]
+            if not user.group_name and u_data["group_name"]:
+                user.group_name = u_data["group_name"]
+            if not user.student_number and u_data["student_number"]:
+                user.student_number = u_data["student_number"]
+            if not user.department:
+                user.department = u_data["department"]
+    db.commit()
+
+    teacher = db.query(User).filter(User.email == "teacher@test.com").first()
+    head = db.query(User).filter(User.email == "head@test.com").first()
+
+    # Topics seeding
+    if db.query(Topic).count() == 0:
+        topics_data = [
+            {
+                "title_ru": "Разработка веб-платформы автоматизации распределения дипломных работ",
+                "title_kz": "Дипломдық жұмыстарды бөлуді автоматтандыруға арналған веб-платформаны әзірлеу",
+                "title_en": "Development of a web platform for automating the distribution of diploma projects",
+                "supervisor_id": teacher.id if teacher else None,
+                "supervisor_name": "Доц. Ахметов К.А.",
+                "department": "ВТиПО",
+                "category": "WEB",
+                "tags": "Web, FastAPI, Vue",
+                "required_skills": "Python, Vue.js, SQL",
+                "difficulty": 4,
+                "has_data": True,
+                "quota_total": 5,
+                "quota_used": 1,
+                "status": "available",
+                "academic_year": "2026-2027",
+                "work_type": "DIPLOMA",
+                "source": "teacher"
+            },
+            {
+                "title_ru": "Система детекции дефектов печатных плат на основе Computer Vision",
+                "title_kz": "Computer Vision негізінде баспалық төлемдер ақауларын анықтау жүйесі",
+                "title_en": "Defect detection system for printed circuit boards based on Computer Vision",
+                "supervisor_id": head.id if head else None,
+                "supervisor_name": "Проф. Касымов А.Б.",
+                "department": "ВТиПО",
+                "category": "AI_ML",
+                "tags": "AI, Computer Vision, PyTorch",
+                "required_skills": "Python, PyTorch, OpenCV",
+                "difficulty": 5,
+                "has_data": True,
+                "quota_total": 4,
+                "quota_used": 1,
+                "status": "available",
+                "academic_year": "2026-2027",
+                "work_type": "DIPLOMA",
+                "source": "teacher"
+            },
+            {
+                "title_ru": "IoT-система мониторинга микроклимата серверных помещений на базе LoRaWAN",
+                "title_kz": "LoRaWAN негізінде серверлік бөлмелердің микроклиматын бақылауға арналған IoT-жүйесі",
+                "title_en": "IoT server room microclimate monitoring system based on LoRaWAN",
+                "supervisor_id": teacher.id if teacher else None,
+                "supervisor_name": "Доц. Ахметов К.А.",
+                "department": "ВТиПО",
+                "category": "IOT",
+                "tags": "IoT, Embedded, Hardware",
+                "required_skills": "C++, ESP32, MQTT",
+                "difficulty": 3,
+                "has_data": True,
+                "quota_total": 5,
+                "quota_used": 0,
+                "status": "available",
+                "academic_year": "2026-2027",
+                "work_type": "DIPLOMA",
+                "source": "teacher"
+            },
+            {
+                "title_ru": "Анализ и обнаружение аномалий сетевого трафика методами машинного обучения",
+                "title_kz": "Машиналық оқыту әдістері арқылы желілік трафик аномалияларын талдау және анықтау",
+                "title_en": "Network traffic anomaly analysis and detection using machine learning",
+                "supervisor_id": head.id if head else None,
+                "supervisor_name": "Проф. Касымов А.Б.",
+                "department": "ВТиПО",
+                "category": "CYBERSECURITY",
+                "tags": "Security, ML, Networks",
+                "required_skills": "Linux, Python, Scikit-Learn",
+                "difficulty": 4,
+                "has_data": False,
+                "quota_total": 4,
+                "quota_used": 0,
+                "status": "available",
+                "academic_year": "2026-2027",
+                "work_type": "DIPLOMA",
+                "source": "teacher"
+            },
+            {
+                "title_ru": "Микросервисная платформа учета академической успеваемости студентов",
+                "title_kz": "Студенттердің академиялық үлгерімін есепке алуға арналған микросервистік платформа",
+                "title_en": "Microservice platform for tracking academic student performance",
+                "supervisor_id": teacher.id if teacher else None,
+                "supervisor_name": "Доц. Ахметов К.А.",
+                "department": "ВТиПО",
+                "category": "WEB",
+                "tags": "Web, Microservices, Docker",
+                "required_skills": "Docker, Go/Python, REST API",
+                "difficulty": 4,
+                "has_data": True,
+                "quota_total": 5,
+                "quota_used": 0,
+                "status": "available",
+                "academic_year": "2026-2027",
+                "work_type": "DIPLOMA",
+                "source": "teacher"
+            },
+            {
+                "title_ru": "Интеллектуальный ассистент технической поддержки для корпоративного сектора",
+                "title_kz": "Корпоративтік сектор үшін техникалық қолдаудың зияткерлік ассистенті",
+                "title_en": "Intelligent tech support assistant for enterprise sector",
+                "supervisor_id": None,
+                "supervisor_name": "ТОО ТехноСервис",
+                "department": "Индустриальные проекты",
+                "category": "INDUSTRIAL",
+                "tags": "Industry, NLP, LLM",
+                "required_skills": "Python, NLP, Prompt Engineering",
+                "difficulty": 4,
+                "has_data": True,
+                "quota_total": 3,
+                "quota_used": 1,
+                "status": "available",
+                "academic_year": "2026-2027",
+                "work_type": "DIPLOMA",
+                "source": "company"
+            }
+        ]
+        for t_info in topics_data:
+            t_obj = Topic(
+                title=t_info["title_ru"],
+                title_ru=t_info["title_ru"],
+                title_kz=t_info["title_kz"],
+                title_en=t_info["title_en"],
+                supervisor_id=t_info["supervisor_id"],
+                supervisor_name=t_info["supervisor_name"],
+                department=t_info["department"],
+                category=t_info["category"],
+                tags=t_info["tags"],
+                required_skills=t_info["required_skills"],
+                difficulty=t_info["difficulty"],
+                has_data=t_info["has_data"],
+                quota_total=t_info["quota_total"],
+                quota_used=t_info["quota_used"],
+                status=t_info["status"],
+                academic_year=t_info["academic_year"],
+                work_type=t_info["work_type"],
+                source=t_info["source"]
+            )
+            db.add(t_obj)
+        db.commit()
+    else:
+        topics = db.query(Topic).all()
+        for t in topics:
+            if not t.title_ru:
+                t.title_ru = t.title
+            if not t.category:
+                t.category = "WEB"
+            if not t.work_type:
+                t.work_type = "DIPLOMA"
+            if not t.academic_year:
+                t.academic_year = "2026-2027"
+            if not t.supervisor_id:
+                if t.supervisor_name and "Ахметов" in t.supervisor_name and teacher:
+                    t.supervisor_id = teacher.id
+                elif t.supervisor_name and "Касымов" in t.supervisor_name and head:
+                    t.supervisor_id = head.id
+        db.commit()
+
+    all_students = db.query(User).filter(User.role == "student").all()
+    for s in all_students:
+        ensure_student_checkpoints(db, s.id)
+
+    # OfficialOrder default record for verification
+    if db.query(OfficialOrder).count() == 0:
+        sample_code = "ORDER-2026-01"
+        order_hash = hashlib.sha256(f"ORDER-104-OD-2026-2027-{sample_code}".encode()).hexdigest()
+        head_user = db.query(User).filter(User.role == "head").first()
+        ord_obj = OfficialOrder(
+            order_number="104-ОД",
+            academic_year="2026-2027",
+            created_at=datetime(2026, 10, 11, 10, 0, 0),
+            created_by=head_user.id if head_user else None,
+            status="SIGNED",
+            verification_code=sample_code,
+            document_hash=order_hash
+        )
+        db.add(ord_obj)
+        db.commit()
+        db.refresh(ord_obj)
+        sync_order_items(ord_obj, db)
+
+    all_orders = db.query(OfficialOrder).all()
+    for o in all_orders:
+        if o.order_number == "104-ОД" and o.verification_code == "ORDER-2026-01" and o.created_at:
+            if o.created_at.strftime("%d.%m.%Y") != "11.10.2026":
+                o.created_at = datetime(2026, 10, 11, 10, 0, 0)
+                db.commit()
+        confirmed_count = db.query(Application).filter(Application.status.in_(["APPROVED", "CONFIRMED_BY_HEAD"])).count()
+        if confirmed_count > 0 and len(o.items) < confirmed_count and o.verification_code == "ORDER-2026-01":
+            sync_order_items(o, db)
+        else:
+            ensure_order_pdf(o, db)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    migrate_database()
+    db = SessionLocal()
+    try:
+        if os.environ.get("META_SEED_DEMO") == "1":
+            seed_database(db)
+    finally:
+        db.close()
+    yield
+
+# ─── FastAPI Application ──────────────────────────────────────────────────────
+app = FastAPI(
+    title="META • Академическая платформа распределения тем",
+    version="1.0.4",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["X-Document-Hash", "X-Verification-Code"],
+)
+
+@app.exception_handler(HTTPException)
+async def friendly_http_exception_handler(request: Request, exc: HTTPException):
+    detail = str(exc.detail) if exc.detail else "Ошибка обработки запроса"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": detail, "error": detail, "status_code": exc.status_code},
+        headers=exc.headers
+    )
+
+# ─── Static Frontend ──────────────────────────────────────────────────────────
+@app.get("/")
+async def serve_index():
+    index_path = Path(__file__).resolve().parent / "index.html"
+    if not index_path.is_file():
+        raise HTTPException(status_code=404, detail="index.html not found")
+    response = FileResponse(str(index_path))
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+# ─── WebSocket Endpoint ───────────────────────────────────────────────────────
+def websocket_session_valid(token: str, user_id: int) -> bool:
+    with SessionLocal() as db:
+        session = db.query(SessionModel).filter(SessionModel.token == token).first()
+        return bool(session and session.user_id == user_id and session.expires_at and
+                    session.expires_at > datetime.utcnow() and session.user and session.user.is_active and
+                    privileged_credentials_allowed(session.user))
+
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: int, token: Optional[str] = Query(None)):
+    origin = websocket.headers.get("origin")
+    if origin and origin.rstrip("/") not in CORS_ORIGINS:
+        await websocket.close(code=1008, reason="Forbidden origin")
+        return
+    auth_header = websocket.headers.get("authorization", "")
+    auth_token = token or (auth_header[7:].strip() if auth_header.startswith("Bearer ") else None)
+    if not auth_token or not websocket_session_valid(auth_token, user_id):
+        await websocket.close(code=1008, reason="Unauthorized or forbidden session")
+        return
+    websocket.state.auth_token = auth_token
+    await ws_manager.connect(user_id, websocket)
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+            if not websocket_session_valid(auth_token, user_id):
+                await websocket.close(code=1008, reason="Session revoked or expired")
+                return
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ws_manager.disconnect(user_id, websocket)
+
+# ─── Authentication APIs ──────────────────────────────────────────────────────
+@app.post("/api/auth/register")
+@app.post("/api/register")
+def register(req: RegisterSchema, db: Session = Depends(get_db, scope="function")):
+    requested_role = (req.role or "student").strip().lower()
+    if requested_role in ["teacher", "head", "admin"] or requested_role != "student":
+        raise HTTPException(
+            status_code=403,
+            detail="Публичная регистрация разрешена только для роли 'student'. Создание ролей teacher, head, admin запрещено."
+        )
+
+    clean_email = req.email.strip().lower()
+    if not req.full_name.strip():
+        raise HTTPException(status_code=422, detail="Имя не может быть пустым")
+    if db.query(User).filter(User.email == clean_email).first():
+        raise HTTPException(status_code=400, detail="Пользователь с таким email уже зарегистрирован")
+
+    # Public signup cannot attest an academic ranking used to award scarce places.
+    gpa_val = 3.5
+    new_user = User(
+        full_name=req.full_name.strip(),
+        email=clean_email,
+        password_hash=hash_password(req.password),
+        role="student",
+        gpa=gpa_val,
+        rating=gpa_val,
+        group_name=req.group_name,
+        student_number=req.student_number,
+        department="ВТиПО",
+        skills=req.skills or "",
+        is_active=True,
+        created_at=datetime.utcnow()
+    )
+    db.add(new_user)
+    db.flush()
+    db.refresh(new_user)
+
+    ensure_student_checkpoints(db, new_user.id)
+
+    token = create_user_session(db, new_user.id)
+    log_audit(db, new_user.id, "REGISTER", f"Регистрация пользователя {new_user.email} с ролью {new_user.role}")
+
+    return {
+        "token": token,
+        "user": {
+            "id": new_user.id,
+            "full_name": new_user.full_name,
+            "email": new_user.email,
+            "role": new_user.role,
+            "gpa": new_user.gpa,
+            "student_number": new_user.student_number,
+            "group_name": new_user.group_name,
+            "department": new_user.department
+        },
+        "id": new_user.id,
+        "full_name": new_user.full_name,
+        "email": new_user.email,
+        "role": new_user.role,
+        "rating": new_user.gpa,
+        "skills": new_user.skills
+    }
+
+@app.post("/api/auth/login")
+@app.post("/api/login")
+def login(req: LoginSchema, request: Request, db: Session = Depends(get_db, scope="function")):
+    ip = request.client.host if request.client else "127.0.0.1"
+    clean_email = req.email.strip().lower()
+    user = db.query(User).filter(User.email == clean_email).first()
+
+    if not user or not verify_password(req.password, user.password_hash):
+        log_audit(db, user.id if user else None, "LOGIN_FAILED", f"Неверный логин или пароль для {clean_email}", user_email=clean_email, ip_address=ip)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Учетная запись деактивирована")
+
+    if user.role in ("teacher", "head", "admin", "company") and req.password == "123456" and os.environ.get("META_SEED_DEMO") != "1":
+        raise HTTPException(status_code=403, detail="Демонстрационный пароль привилегированной учетной записи запрещен вне demo-режима; требуется смена пароля")
+
+    if not user.password_hash.startswith("pbkdf2:sha256:"):
+        user.password_hash = hash_password(req.password)
+    token = create_user_session(db, user.id)
+    log_audit(db, user.id, "LOGIN", f"Успешный вход в систему: {user.email}", user_email=user.email, ip_address=ip)
+
+    return {
+        "token": token,
+        "user": {
+            "id": user.id,
+            "full_name": user.full_name,
+            "email": user.email,
+            "role": user.role,
+            "gpa": user.gpa,
+            "student_number": user.student_number,
+            "group_name": user.group_name,
+            "department": user.department
+        },
+        "id": user.id,
+        "full_name": user.full_name,
+        "email": user.email,
+        "role": user.role,
+        "rating": user.gpa or user.rating,
+        "skills": user.skills
+    }
+
+@app.get("/api/auth/me")
+def get_me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "full_name": current_user.full_name,
+        "email": current_user.email,
+        "role": current_user.role,
+        "gpa": current_user.gpa,
+        "student_number": current_user.student_number,
+        "group_name": current_user.group_name,
+        "department": current_user.department,
+        "skills": current_user.skills
+    }
+
+# ─── Anti-Duplicate & String Normalization ────────────────────────────────────
+def normalize_text(text_val: str) -> str:
+    cleaned = re.sub(r'[^\w\s]', ' ', (text_val or "").lower())
+    return " ".join(cleaned.split())
+
+def calculate_similarity(text1: str, text2: str) -> float:
+    t1 = normalize_text(text1)
+    t2 = normalize_text(text2)
+    if not t1 or not t2:
+        return 0.0
+    return SequenceMatcher(None, t1, t2).ratio() * 100.0
+
+@app.post("/api/topics/check-duplicate")
+def check_duplicate(req: TopicCheckSchema, db: Session = Depends(get_db, scope="function")):
+    topics = db.query(Topic).all()
+    proposals = db.query(CustomTopicProposal).all()
+
+    max_sim = 0.0
+    matched_title = ""
+
+    for t in topics:
+        for t_text in [t.title_ru, t.title, t.title_kz, t.title_en]:
+            if t_text:
+                sim = calculate_similarity(req.title, t_text)
+                if sim > max_sim:
+                    max_sim = sim
+                    matched_title = t.title_ru or t.title
+
+    for p in proposals:
+        for p_text in [p.title_ru, p.title_raw, p.title_kz, p.title_en]:
+            if p_text:
+                sim = calculate_similarity(req.title, p_text)
+                if sim > max_sim:
+                    max_sim = sim
+                    matched_title = p.title_ru or p.title_raw
+
+    threshold = 75.0
+    is_dup = max_sim >= threshold
+
+    return {
+        "is_duplicate": is_dup,
+        "similarity": round(max_sim, 1),
+        "matched_topic": matched_title,
+        "threshold": threshold,
+        "status": "duplicate" if is_dup else "unique",
+        "message": f"Тема слишком похожа на существующую ({round(max_sim, 1)}% совпадения с «{matched_title}»). Переформулируйте." if is_dup else f"Тема уникальна (макс. сходство {round(max_sim, 1)}%). Доступна к подаче."
+    }
+
+# ─── Topics Catalog & Passport ────────────────────────────────────────────────
+@app.get("/api/topics")
+def get_topics(
+    q: Optional[str] = None,
+    department: Optional[str] = None,
+    category: Optional[str] = None,
+    tag: Optional[str] = None,
+    difficulty: Optional[int] = None,
+    work_type: Optional[str] = None,
+    db: Session = Depends(get_db, scope="function")
+):
+    query = db.query(Topic)
+    if q:
+        kw = f"%{q.strip()}%"
+        query = query.filter(
+            (Topic.title.ilike(kw)) |
+            (Topic.title_ru.ilike(kw)) |
+            (Topic.title_kz.ilike(kw)) |
+            (Topic.title_en.ilike(kw)) |
+            (Topic.supervisor_name.ilike(kw)) |
+            (Topic.tags.ilike(kw))
+        )
+    if department:
+        query = query.filter(Topic.department == department)
+    if category:
+        query = query.filter(Topic.category == category)
+    if tag:
+        query = query.filter(Topic.tags.ilike(f"%{tag}%"))
+    if difficulty:
+        query = query.filter(Topic.difficulty == difficulty)
+    if work_type:
+        query = query.filter(Topic.work_type == work_type)
+
+    topics = query.all()
+    return [{
+        "id": t.id,
+        "title": t.title_ru or t.title,
+        "title_ru": t.title_ru or t.title,
+        "title_kz": t.title_kz,
+        "title_en": t.title_en,
+        "supervisor_id": t.supervisor_id,
+        "supervisor_name": t.supervisor_name,
+        "department": t.department,
+        "category": t.category,
+        "tags": t.tags,
+        "required_skills": t.required_skills,
+        "difficulty": t.difficulty,
+        "has_data": t.has_data,
+        "quota_total": t.quota_total,
+        "quota_used": t.quota_used,
+        "status": t.status,
+        "academic_year": t.academic_year,
+        "work_type": t.work_type,
+        "source": t.source
+    } for t in topics]
+
+@app.get("/api/topics/{topic_id}/passport")
+def get_topic_passport(topic_id: int, db: Session = Depends(get_db, scope="function")):
+    topic = db.query(Topic).filter(Topic.id == topic_id).first()
+    if not topic:
+        raise HTTPException(status_code=404, detail="Тема не найдена")
+
+    apps_count = db.query(Application).filter(Application.topic_id == topic_id).count()
+    past_works = [
+        {"year": 2024, "student": "Сарсенов Д.К.", "grade": "95/100 (A)", "outcome": "Внедрено в образовательный процесс кафедры ВТиПО", "advisor": topic.supervisor_name},
+        {"year": 2025, "student": "Омарова А.Б.", "grade": "92/100 (A-)", "outcome": "Опубликована статья в Вестнике КазНИТУ", "advisor": topic.supervisor_name}
+    ]
+
+    return {
+        "id": topic.id,
+        "title": topic.title_ru or topic.title,
+        "title_ru": topic.title_ru or topic.title,
+        "title_kz": topic.title_kz,
+        "title_en": topic.title_en,
+        "supervisor_id": topic.supervisor_id,
+        "supervisor_name": topic.supervisor_name,
+        "department": topic.department,
+        "category": topic.category,
+        "tags": topic.tags,
+        "required_skills": topic.required_skills,
+        "difficulty": topic.difficulty,
+        "has_data": topic.has_data,
+        "quota_total": topic.quota_total,
+        "quota_used": topic.quota_used,
+        "work_type": topic.work_type,
+        "source": topic.source,
+        "times_selected": apps_count + 3,
+        "hardware_software_requirements": f"ПК с поддержкой GPU (для AI/CV) / среды разработки ({topic.required_skills})",
+        "expected_result": "Готовый программный прототип, техническая документация и презентация к защите",
+        "past_works": past_works
+    }
+
+# ─── Custom Topic Proposal Workflow ───────────────────────────────────────────
+@app.post("/api/custom-topics")
+def propose_custom_topic(
+    req: CustomTopicCreateSchema,
+    current_user: User = Depends(require_role("student")),
+    db: Session = Depends(get_db, scope="function")
+):
+    if not req.title_raw.strip() or not 1 <= req.difficulty <= 5:
+        raise HTTPException(status_code=422, detail="Недопустимые параметры темы")
+    if req.supervisor_id is not None:
+        supervisor = db.get(User, req.supervisor_id)
+        if not supervisor or supervisor.role not in ("teacher", "head", "admin") or not supervisor.is_active:
+            raise HTTPException(status_code=400, detail="Недопустимый научный руководитель")
+    topics = db.query(Topic).all()
+    max_sim = 0.0
+    for t in topics:
+        for t_text in [t.title_ru, t.title]:
+            if t_text:
+                sim = calculate_similarity(req.title_raw, t_text)
+                if sim > max_sim:
+                    max_sim = sim
+
+    proposal = CustomTopicProposal(
+        student_id=current_user.id,
+        title_raw=req.title_raw.strip(),
+        title_ru=req.title_ru or req.title_raw.strip(),
+        title_kz=req.title_kz or f"{req.title_raw.strip()} (қаз)",
+        title_en=req.title_en or f"{req.title_raw.strip()} (en)",
+        supervisor_id=req.supervisor_id,
+        category=req.category,
+        difficulty=req.difficulty,
+        duplicate_score=round(max_sim, 1),
+        status="PROPOSED",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
+    )
+    db.add(proposal)
+    db.commit()
+    db.refresh(proposal)
+
+    log_audit(db, current_user.id, "CUSTOM_TOPIC_CREATED", f"Студент {current_user.full_name} предложил тему: «{proposal.title_raw}» (дубликат: {proposal.duplicate_score}%)")
+
+    # Notify supervisor or head
+    if proposal.supervisor_id:
+        create_notification(db, proposal.supervisor_id, "Новая инициативная тема", f"Студент {current_user.full_name} предложил тему: «{proposal.title_raw}»", "info")
+
+    return {
+        "message": "Инициативная тема передана на согласование научному руководителю",
+        "proposal_id": proposal.id,
+        "duplicate_score": proposal.duplicate_score,
+        "status": proposal.status
+    }
+
+@app.get("/api/custom-topics")
+def list_custom_topics(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function")
+):
+    if current_user.role not in ("student", "teacher", "head", "admin"):
+        raise HTTPException(status_code=403, detail="Недостаточно прав")
+    query = db.query(CustomTopicProposal)
+    if current_user.role == "student":
+        query = query.filter(CustomTopicProposal.student_id == current_user.id)
+    elif current_user.role == "teacher":
+        query = query.filter((CustomTopicProposal.supervisor_id == current_user.id) | (CustomTopicProposal.supervisor_id.is_(None)))
+
+    proposals = query.order_by(CustomTopicProposal.created_at.desc()).all()
+    return [{
+        "id": p.id,
+        "student_id": p.student_id,
+        "student_name": p.student.full_name if p.student else "",
+        "title_raw": p.title_raw,
+        "title_ru": p.title_ru,
+        "title_kz": p.title_kz,
+        "title_en": p.title_en,
+        "category": p.category,
+        "difficulty": p.difficulty,
+        "duplicate_score": p.duplicate_score,
+        "status": p.status,
+        "supervisor_id": p.supervisor_id,
+        "supervisor_comment": p.supervisor_comment,
+        "head_comment": p.head_comment,
+        "created_at": p.created_at.strftime("%d.%m.%Y %H:%M")
+    } for p in proposals]
+
+@app.post("/api/custom-topics/{proposal_id}/supervisor-decision")
+def supervisor_decide_custom_topic(
+    proposal_id: int,
+    req: CustomTopicSupervisorDecisionSchema,
+    current_user: User = Depends(require_role("teacher", "head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+    prop = db.query(CustomTopicProposal).filter(CustomTopicProposal.id == proposal_id).first()
+    if not prop:
+        raise HTTPException(status_code=404, detail="Предложение темы не найдено")
+
+    if current_user.role == "teacher" and prop.supervisor_id and prop.supervisor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Вы не являетесь научным руководителем данной темы")
+
+    if prop.status not in ("PROPOSED", "DRAFT"):
+        raise HTTPException(status_code=409, detail="Решение по теме уже зафиксировано")
+    if prop.supervisor_id is None:
+        prop.supervisor_id = current_user.id
+    if req.status not in ["SUPERVISOR_APPROVED", "REJECTED"]:
+        raise HTTPException(status_code=400, detail="Недопустимый статус решения научрука")
+
+    prop.status = req.status
+    prop.supervisor_comment = req.comment
+    prop.updated_at = datetime.utcnow()
+    db.commit()
+
+    create_notification(
+        db,
+        prop.student_id,
+        f"Решение руководителя по инициативной теме",
+        f"Тема «{prop.title_raw}»: {req.status}. Комментарий: {req.comment or 'нет'}",
+        "success" if req.status == "SUPERVISOR_APPROVED" else "warning"
+    )
+    return {"message": "Решение руководителя зафиксировано", "status": prop.status}
+
+@app.post("/api/custom-topics/{proposal_id}/head-decision")
+def head_decide_custom_topic(proposal_id: int, req: CustomTopicHeadDecisionSchema,
+    current_user: User = Depends(require_role("head", "admin")), db: Session = Depends(get_db, scope="function")):
+    proposal = db.get(CustomTopicProposal, proposal_id)
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Предложение темы не найдено")
+    if req.status not in ("HEAD_APPROVED", "REJECTED"):
+        raise HTTPException(status_code=400, detail="Недопустимый статус решения завкафедрой")
+    if proposal.status in ("HEAD_APPROVED", "REJECTED"):
+        raise HTTPException(status_code=409, detail="Решение по теме уже зафиксировано")
+    new_topic_id = None
+    if req.status == "HEAD_APPROVED":
+        if proposal.status != "SUPERVISOR_APPROVED" or not proposal.supervisor_id:
+            raise HTTPException(status_code=400, detail="Сначала требуется согласование научного руководителя")
+        supervisor = db.get(User, proposal.supervisor_id)
+        if not supervisor or not supervisor.is_active or supervisor.role not in ("teacher", "head", "admin"):
+            raise HTTPException(status_code=400, detail="Недопустимый руководитель")
+        assigned = db.query(Application).filter(Application.student_id == proposal.student_id,
+            Application.status.in_(ASSIGNED_STATUSES)).first()
+        if assigned:
+            raise HTTPException(status_code=409, detail="У студента уже есть одобренная или утвержденная тема")
+        db.query(Application).filter(Application.student_id == proposal.student_id,
+            Application.status == "SUBMITTED").update({Application.status: "REJECTED",
+                Application.reject_reason: "Утверждена инициативная тема"})
+        topic = Topic(title=proposal.title_ru or proposal.title_raw, title_ru=proposal.title_ru or proposal.title_raw,
+            title_kz=proposal.title_kz, title_en=proposal.title_en, supervisor_id=supervisor.id,
+            supervisor_name=supervisor.full_name, category=proposal.category, difficulty=proposal.difficulty,
+            quota_total=req.quota_total, quota_used=1, status="full" if req.quota_total == 1 else "available", source="student")
+        db.add(topic)
+        db.flush()
+        new_topic_id = topic.id
+        application = Application(student_id=proposal.student_id, topic_id=topic.id, custom_topic_id=proposal.id,
+            priority=1, motivation=proposal.title_raw, status="CONFIRMED_BY_HEAD")
+        db.add(application)
+        db.flush()
+        create_default_checkpoints(db, application.id)
+    proposal.status = req.status
+    proposal.head_comment = req.comment
+    proposal.updated_at = datetime.utcnow()
+    create_notification(db, proposal.student_id, "Решение заведующего кафедрой", f"Тема: {proposal.status}")
+    log_audit(db, current_user.id, "CUSTOM_TOPIC_HEAD_DECISION", f"Предложение #{proposal.id}: {proposal.status}")
+    db.commit()
+    return {"message": "Решение заведующего кафедрой зафиксировано", "status": proposal.status,
+            "official_topic_id": new_topic_id}
+
+# ─── Deterministic Offline Smart Topic Assistant ──────────────────────────────
+@app.post("/api/ai/refine-topic")
+def ai_refine_topic(req: AiRefineSchema):
+    raw = req.raw_idea.strip()
+    text_lower = raw.lower()
+
+    if any(k in text_lower for k in ["доставк", "еда", "магазин", "сайт", "web", "платформ", "сервис", "веб"]):
+        title_ru = "Разработка распределённой веб-платформы автоматизации сервисов доставки с микросервисной архитектурой и оптимизацией маршрутов"
+        title_kz = "Маршруттарды оңтайландыратын және микросервистік архитектурасы бар жеткізу қызметтерін автоматтандыруға арналған үлестірілген веб-платформаны әзірлеу"
+        title_en = "Development of a distributed web platform for automating delivery services with microservice architecture and route optimization"
+        category = "WEB"
+        difficulty = 4
+        keywords = ["FastAPI", "Vue.js", "PostgreSQL", "Docker", "Route Optimization"]
+        description = "Проект ориентирован на проектирование и реализацию отказоустойчивой веб-платформы для кафедрального и индустриального сектора."
+        checkpoints = [
+            "Анализ алгоритмов маршрутизации и ТЗ",
+            "Проектирование схемы БД и REST API",
+            "Реализация сервисов и клиентского интерфейса",
+            "Нагрузочное тестирование и оформление ВКР"
+        ]
+        recommended_stack = "FastAPI, PostgreSQL, Redis, Vue.js 3, Docker, Leaflet / OpenStreetMap"
+        engineering_tasks = [
+            "1. Проектирование реляционной схемы базы данных и RESTful API взаимодействия микросервисов",
+            "2. Реализация эвристического алгоритма оптимизации распределения заказов между курьерами",
+            "3. Разработка клиентского Single Page Application с адаптивным интерфейсом и real-time трекингом"
+        ]
+    elif any(k in text_lower for k in ["зрен", "камер", "дефект", "видео", "распознав", "ai", "нейросет", "cv", "ml"]):
+        title_ru = "Исследование и программная реализация нейросетевой системы компьютерного зрения для автоматизированной детекции дефектов"
+        title_kz = "Ақауларды автоматтандырылған анықтауға арналған компьютерлік көру нейрожелілік жүйесін зерттеу және бағдарламалық жүзеге асыру"
+        title_en = "Research and software implementation of a neural network computer vision system for automated defect detection"
+        category = "AI_ML"
+        difficulty = 5
+        keywords = ["PyTorch", "OpenCV", "YOLOv8", "Computer Vision", "CUDA"]
+        description = "Система высокоточной оптической инспекции изделий на базе свёрточных нейронных сетей с аппаратным ускорением."
+        checkpoints = [
+            "Сбор и аугментация предметного датасета",
+            "Обучение и fine-tuning свёрточной модели",
+            "Разработка конвейера инференса реального времени",
+            "Тестирование метрик mAP и подготовка отчёта"
+        ]
+        recommended_stack = "Python, PyTorch, OpenCV, FastAPI, CUDA, TensorRT"
+        engineering_tasks = [
+            "1. Формирование и аугментация предметного набора данных визуального контроля",
+            "2. Обучение и сравнительный анализ архитектур свёрточных нейронных сетей (YOLOv8, Faster R-CNN)",
+            "3. Интеграция обученной модели в конвейер обработки видеопотока в реальном масштабе времени"
+        ]
+    elif any(k in text_lower for k in ["безопасн", "трафик", "ddos", "атак", "сеть", "уязвим", "крипто"]):
+        title_ru = "Разработка программно-аппаратного комплекса обнаружения сетевых аномалий и защиты от распределённых атак"
+        title_kz = "Желілік аномалияларды анықтауға және үлестірілген шабуылдардан қорғауға арналған бағдарламалық-аппараттық кешенді әзірлеу"
+        title_en = "Development of a software and hardware complex for detecting network anomalies and protecting against distributed attacks"
+        category = "CYBERSECURITY"
+        difficulty = 4
+        keywords = ["Network Security", "Machine Learning", "eBPF", "Packet Analysis"]
+        description = "Комплекс сигнатурного и статистического анализа входящего сетевого трафика с применением моделей машинного обучения."
+        checkpoints = [
+            "Анализ векторов сетевых атак и структуры пакетов",
+            "Обучение детекторов аномалий (Isolation Forest)",
+            "Реализация модуля автоматической фильтрации",
+            "Стресс-тестирование и итоговая верификация"
+        ]
+        recommended_stack = "Python, Scikit-learn, eBPF, Wireshark/libpcap, Grafana, Docker"
+        engineering_tasks = [
+            "1. Сбор и статистическая обработка сетевых телеметрических признаков сетевых пакетов",
+            "2. Обучение моделей обнаружения аномалий без учителя (Isolation Forest, Autoencoder)",
+            "3. Разработка модуля фильтрации нелегитимного трафика с минимальной задержкой обработки"
+        ]
+    elif any(k in text_lower for k in ["iot", "датчик", "lora", "arduino", "умный", "контроллер"]):
+        title_ru = "Разработка распределенной IoT-системы телеметрического мониторинга параметров окружающей среды на базе протокола LoRaWAN"
+        title_kz = "LoRaWAN хаттамасы негізінде қоршаған орта параметрлерін телеметриялық бақылаудың үлестірілген IoT жүйесін әзірлеу"
+        title_en = "Development of a distributed IoT telemetry monitoring system for environmental parameters based on the LoRaWAN protocol"
+        category = "IOT"
+        difficulty = 4
+        keywords = ["IoT", "LoRaWAN", "ESP32", "MQTT", "Time-Series DB"]
+        description = "Энергоэффективная беспроводная сенсорная сеть для сбора показателей в режиме 24/7."
+        checkpoints = [
+            "Разработка схемы аппаратного контроллера",
+            "Настройка LoRaWAN шлюза и сетевого сервера",
+            "Реализация дашборда мониторинга и алертов",
+            "Полевые испытания и калибровка сенсоров"
+        ]
+        recommended_stack = "C++, ESP32, FreeRTOS, MQTT, InfluxDB, Grafana"
+        engineering_tasks = [
+            "1. Схемотехническое проектирование автономного сенсорного узла с низким энергопотреблением",
+            "2. Реализация стека передачи данных поверх протокола LoRaWAN",
+            "3. Разработка центрального сервера сбора данных и графической панели визуализации"
+        ]
+    else:
+        title_ru = f"Исследование и разработка интеллектуального программного комплекса для предметной области «{raw}»"
+        title_kz = f"«{raw}» пәндік саласы үшін зияткерлік бағдарламалық кешенді зерттеу және әзірлеу"
+        title_en = f"Research and development of an intelligent software complex for domain «{raw}»"
+        category = "WEB"
+        difficulty = 3
+        keywords = ["Python 3.11", "FastAPI", "SQLAlchemy", "Architecture", "Engineering"]
+        description = f"Комплексное проектирование модульной программной системы, решающей прикладные задачи в области «{raw}»."
+        checkpoints = [
+            "Формализация требований и спецификация ТЗ",
+            "Проектирование структуры данных и алгоритмов",
+            "Программная реализация модулей системы",
+            "Тестирование и оформление пояснительной записки"
+        ]
+        recommended_stack = "Python 3.11, FastAPI, SQLAlchemy, Vue.js, Tailwind CSS, Docker"
+        engineering_tasks = [
+            "1. Анализ предметной области и формализация математической модели функционирования системы",
+            "2. Проектирование модульной архитектуры и реализация серверных вычислительных компонентов",
+            "3. Проведение экспериментального тестирования производительности и оценка масштабируемости"
+        ]
+
+    return {
+        "title_ru": title_ru,
+        "title_kz": title_kz,
+        "title_en": title_en,
+        "category": category,
+        "difficulty": difficulty,
+        "keywords": keywords,
+        "description": description,
+        "checkpoints": checkpoints,
+        "academic_title": title_ru,
+        "recommended_stack": recommended_stack,
+        "engineering_tasks": engineering_tasks
+    }
+
+# ─── Student Recommendations ──────────────────────────────────────────────────
+@app.get("/api/recommendations")
+def get_recommendations(student_id: int, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)):
+    require_student_access(db, current_user, student_id)
+    student = db.query(User).filter(User.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Студент не найден")
+
+    st_skills = [s.strip().lower() for s in (student.skills or "").split(",") if s.strip()]
+    topics = db.query(Topic).filter(Topic.status == "available").all()
+
+    scored = []
+    for t in topics:
+        topic_skills = [s.strip().lower() for s in (t.required_skills or "").split(",") if s.strip()]
+        topic_tags = [s.strip().lower() for s in (t.tags or "").split(",") if s.strip()]
+
+        skill_matches = sum(1 for sk in st_skills if any(sk in ts or ts in sk for ts in topic_skills + topic_tags))
+        score = skill_matches * 30
+
+        if student.gpa and student.gpa >= 3.67 and t.difficulty >= 4:
+            score += 20
+        elif student.gpa and student.gpa < 3.0 and t.difficulty <= 3:
+            score += 20
+
+        score = min(score + 15, 98)
+        scored.append({
+            "topic": {
+                "id": t.id,
+                "title": t.title_ru or t.title,
+                "supervisor_name": t.supervisor_name,
+                "department": t.department,
+                "tags": t.tags,
+                "required_skills": t.required_skills,
+                "difficulty": t.difficulty,
+                "quota_total": t.quota_total,
+                "quota_used": t.quota_used
+            },
+            "match_percent": score,
+            "matched_skills": [s for s in st_skills if any(s in ts for ts in topic_skills + topic_tags)]
+        })
+
+    scored.sort(key=lambda x: x["match_percent"], reverse=True)
+    return scored[:4]
+
+# ─── Student: Preferences & Application Submission ────────────────────────────
+@app.get("/api/preferences")
+def get_preferences(student_id: int, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)):
+    require_student_access(db, current_user, student_id)
+    prefs = db.query(Preference).filter(Preference.student_id == student_id).order_by(Preference.rank).all()
+    return [{
+        "id": p.id,
+        "rank": p.rank,
+        "topic_id": p.topic_id,
+        "topic_title": p.topic.title_ru or p.topic.title if p.topic else "",
+        "supervisor_name": p.topic.supervisor_name if p.topic else "",
+        "department": p.topic.department if p.topic else ""
+    } for p in prefs]
+
+@app.post("/api/preferences")
+def save_preferences(req: PreferencesSchema, current_user: User = Depends(require_role("student")), db: Session = Depends(get_db, scope="function")):
+    if req.student_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Нельзя менять чужие приоритеты")
+    if len(req.topic_ids) > 3 or len(set(req.topic_ids)) != len(req.topic_ids):
+        raise HTTPException(status_code=400, detail="Нужны не более трех уникальных тем")
+    for topic_id in req.topic_ids:
+        if topic_id <= 0 or not db.get(Topic, topic_id):
+            raise HTTPException(status_code=404, detail="Тема не найдена")
+    if db.query(Application).filter(Application.student_id == current_user.id, Application.status.in_(ASSIGNED_STATUSES)).first():
+        raise HTTPException(status_code=409, detail="Нельзя менять приоритеты после распределения")
+    db.query(Preference).filter(Preference.student_id == current_user.id).delete()
+    db.flush()
+    for rank, topic_id in enumerate(req.topic_ids, 1):
+        db.add(Preference(student_id=current_user.id, topic_id=topic_id, priority=rank, rank=rank))
+    log_audit(db, current_user.id, "PREFERENCES_SAVED", f"Сохранено {len(req.topic_ids)} приоритетов")
+    return {"message": "Приоритеты успешно сохранены"}
+
+@app.post("/api/applications/apply")
+@app.post("/api/apply")
+async def apply_application(
+    req: ApplicationApplySchema,
+    request: Request,
+    current_user: User = Depends(require_role("student")),
+    db: Session = Depends(get_db, scope="function")
+):
+    ip = request.client.host if request.client else "127.0.0.1"
+
+    student_id = current_user.id
+    if req.student_id is not None and req.student_id != student_id:
+        raise HTTPException(status_code=403, detail="Нельзя подавать заявку от чужого имени")
+    if req.topic_id is None:
+        raise HTTPException(status_code=400, detail="Для инициативной темы используйте согласование custom-topics")
+    if req.topic_id <= 0 or req.custom_topic_id is not None:
+        raise HTTPException(status_code=400, detail="Недопустимая ссылка на тему")
+
+    # 1. Проверка приоритета (только 1, 2, 3)
+    if req.priority not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="Приоритет заявки должен быть 1, 2 или 3")
+
+    # 2. Проверка: студент не может получить две финально утверждённые темы
+    already_confirmed = db.query(Application).filter(
+        Application.student_id == student_id,
+        Application.status.in_(["APPROVED", "SUPERVISOR_APPROVED", "CONFIRMED_BY_HEAD", "ALLOCATED"])
+    ).first()
+    if already_confirmed:
+        raise HTTPException(status_code=400, detail="У вас уже есть одобренная или утвержденная тема дипломного проекта")
+
+    # 3. Проверка: студент не подает одну тему дважды
+    if req.topic_id:
+        duplicate_topic = db.query(Application).filter(
+            Application.student_id == student_id,
+            Application.topic_id == req.topic_id,
+            Application.id.isnot(None)
+        ).first()
+        if duplicate_topic:
+            raise HTTPException(status_code=400, detail="Вы уже подали заявку на эту тему")
+
+    # 4. Проверка: нельзя иметь одинаковый priority у двух активных заявок
+    duplicate_priority = db.query(Application).filter(
+        Application.student_id == student_id,
+        Application.priority == req.priority,
+        Application.status.in_(["SUBMITTED", "APPROVED", "SUPERVISOR_APPROVED", "CONFIRMED_BY_HEAD", "ALLOCATED"])
+    ).first()
+    if duplicate_priority:
+        raise HTTPException(status_code=400, detail=f"У вас уже есть активная заявка с приоритетом №{req.priority}")
+
+    topic = None
+    if req.topic_id:
+        topic = db.query(Topic).filter(Topic.id == req.topic_id).first()
+        if not topic:
+            raise HTTPException(status_code=404, detail="Выбранная тема не найдена в реестре кафедры")
+        # 5. Проверка: нельзя подаваться на full topic и quota нельзя превышать
+        if topic.status == "full" or topic.quota_used >= topic.quota_total:
+            raise HTTPException(status_code=400, detail="TOPIC_FULL: Все места на данную тему исчерпаны (квота заполнена)")
+
+    new_app = Application(
+        student_id=student_id,
+        topic_id=req.topic_id,
+        custom_topic_id=req.custom_topic_id,
+        priority=req.priority,
+        custom_title=req.custom_title,
+        motivation=req.motivation or "Хочу реализовать дипломный проект по данному направлению",
+        status="SUBMITTED",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
+    )
+    db.add(new_app)
+    db.flush()
+    db.refresh(new_app)
+
+    # Sync into preferences
+    if req.topic_id:
+        db.query(Preference).filter(
+            Preference.student_id == student_id,
+            (Preference.topic_id == req.topic_id) | (Preference.priority == req.priority) | (Preference.rank == req.priority)
+        ).delete(synchronize_session=False)
+        db.add(Preference(student_id=student_id, topic_id=req.topic_id, priority=req.priority, rank=req.priority))
+        db.flush()
+
+    topic_title = (topic.title_ru or topic.title) if topic else (req.custom_title or "Инициативная тема")
+    log_audit(db, student_id, "APPLICATION_CREATED", f"Подача заявки #{new_app.id} с приоритетом №{new_app.priority} на тему «{topic_title}»", ip_address=ip)
+
+    # Notify supervisor
+    if topic and topic.supervisor_id:
+        create_notification(db, topic.supervisor_id, "Новая заявка на тему", f"Студент подал заявку на тему «{topic_title}» (приоритет {new_app.priority})", "info")
+
+    db.commit()
+    await send_workflow_event(db, student_id, topic.supervisor_id if topic else None, {
+        "event": "NEW_APPLICATION_SUBMITTED",
+        "app_id": new_app.id,
+        "student_id": student_id,
+        "topic_title": topic_title,
+        "priority": new_app.priority
+    })
+
+    return {
+        "message": "Заявка успешно принята к рассмотрению",
+        "application_id": new_app.id,
+        "priority": new_app.priority
+    }
+
+@app.get("/api/applications")
+def get_all_applications(db: Session = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)):
+    query = db.query(Application)
+    if current_user.role == "student":
+        query = query.filter(Application.student_id == current_user.id)
+    elif current_user.role == "teacher":
+        query = query.join(Topic, Application.topic_id == Topic.id).filter(Topic.supervisor_id == current_user.id)
+    elif current_user.role not in ("head", "admin"):
+        raise HTTPException(status_code=403, detail="Недостаточно прав")
+    apps = query.order_by(Application.id.desc()).all()
+    return [{
+        "id": a.id,
+        "student_id": a.student_id,
+        "student_name": a.student.full_name if a.student else "",
+        "student_rating": a.student.gpa if a.student else 3.5,
+        "student_gpa": a.student.gpa if a.student else 3.5,
+        "student_skills": a.student.skills if a.student else "",
+        "topic_id": a.topic_id,
+        "topic_title": (a.topic.title_ru or a.topic.title) if a.topic else a.custom_title,
+        "supervisor_name": a.topic.supervisor_name if a.topic else "На согласовании",
+        "priority": a.priority,
+        "motivation": a.motivation,
+        "status": a.status,
+        "reject_reason": a.reject_reason,
+        "created_at": a.created_at.strftime("%d.%m.%Y %H:%M") if a.created_at else ""
+    } for a in apps]
+
+@app.get("/api/student-applications/{student_id}")
+def get_student_applications(student_id: int, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)):
+    require_student_access(db, current_user, student_id)
+    apps = db.query(Application).filter(Application.student_id == student_id).order_by(Application.id.desc()).all()
+    return [{
+        "id": a.id,
+        "topic_id": a.topic_id,
+        "topic_title": (a.topic.title_ru or a.topic.title) if a.topic else a.custom_title,
+        "supervisor_name": a.topic.supervisor_name if a.topic else "На согласовании",
+        "priority": a.priority,
+        "motivation": a.motivation,
+        "status": a.status,
+        "reject_reason": a.reject_reason,
+        "created_at": a.created_at.strftime("%d.%m.%Y %H:%M") if a.created_at else ""
+    } for a in apps]
+
+# ─── Teacher Decisions & Access Rules ─────────────────────────────────────────
+@app.post("/api/applications/decide")
+@app.post("/api/decide")
+async def decide_application(req: ApplicationDecideSchema, request: Request,
+    current_user: User = Depends(require_role("teacher", "head", "admin")), db: Session = Depends(get_db, scope="function")):
+    application = db.get(Application, req.application_id)
+    if not application:
+        raise HTTPException(status_code=404, detail="Заявка не найдена в системе")
+    topic = application.topic
+    supervisor_id = topic.supervisor_id if topic else (application.custom_topic.supervisor_id if application.custom_topic else None)
+    if current_user.role == "teacher" and supervisor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Преподаватель может принимать решения только по своим темам")
+    if req.decided_by_id is not None and req.decided_by_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Нельзя подменять автора решения")
+    if req.decision not in ("APPROVE", "REJECT"):
+        raise HTTPException(status_code=400, detail="Недопустимое решение. Разрешено: APPROVE или REJECT")
+    if application.status == "CONFIRMED_BY_HEAD":
+        raise HTTPException(status_code=400, detail="Заявка уже утверждена заведующим кафедрой")
+    if application.status == "REJECTED":
+        if req.decision == "APPROVE" and db.query(Application).filter(Application.student_id == application.student_id, Application.status.in_(ASSIGNED_STATUSES)).first():
+            raise HTTPException(status_code=400, detail="У студента уже есть одобренная или утвержденная тема")
+        raise HTTPException(status_code=400, detail="Заявка уже отклонена")
+    if req.decision == "APPROVE":
+        other = db.query(Application).filter(Application.student_id == application.student_id,
+            Application.id != application.id, Application.status.in_(ASSIGNED_STATUSES)).first()
+        if other:
+            raise HTTPException(status_code=400, detail="У студента уже есть одобренная или утвержденная тема")
+        if application.status in ("APPROVED", "SUPERVISOR_APPROVED"):
+            if current_user.role == "teacher":
+                raise HTTPException(status_code=400, detail="Заявка уже одобрена")
+            application.status = "CONFIRMED_BY_HEAD"
+        else:
+            if current_user.role in ("head", "admin") and supervisor_id != current_user.id:
+                raise HTTPException(status_code=400, detail="Заведующий кафедрой может утверждать только заявки, уже согласованные преподавателем")
+            if application.status not in ("SUBMITTED", "ALLOCATED"):
+                raise HTTPException(status_code=400, detail="Недопустимый переход статуса заявки")
+            if topic and application.status != "ALLOCATED":
+                result = db.execute(text("UPDATE topics SET quota_used=quota_used+1, status=CASE WHEN quota_used+1>=quota_total THEN 'full' ELSE 'available' END WHERE id=:id AND quota_used<quota_total"), {"id": topic.id})
+                if result.rowcount != 1:
+                    raise HTTPException(status_code=400, detail="TOPIC_FULL: Квота мест на данную тему исчерпана")
+                db.refresh(topic)
+            application.status = "APPROVED"
+        application.reject_reason = None
+        # Close other pending choices in the same transaction as assignment/quota.
+        db.query(Application).filter(Application.student_id == application.student_id,
+            Application.id != application.id, Application.status == "SUBMITTED").update({
+                Application.status: "REJECTED", Application.reject_reason: "Студент получил распределение по теме"})
+        create_default_checkpoints(db, application.id)
+    else:
+        reason = (req.reason or "").strip()
+        if not reason:
+            raise HTTPException(status_code=400, detail="При отклонении заявки обязательно указать причину отказа")
+        if topic and application.status in ASSIGNED_STATUSES:
+            db.execute(text("UPDATE topics SET quota_used=quota_used-1, status='available' WHERE id=:id AND quota_used>0"), {"id": topic.id})
+        application.status = "REJECTED"
+        application.reject_reason = reason
+        db.flush()
+        # Reuse an existing pending fallback, never INSERT a duplicate topic/priority.
+        next_pref = db.query(Preference).filter(Preference.student_id == application.student_id,
+            Preference.rank > application.priority).order_by(Preference.rank).first()
+        if next_pref and next_pref.rank <= 3 and next_pref.topic and next_pref.topic.quota_used < next_pref.topic.quota_total:
+            existing = db.query(Application).filter(Application.student_id == application.student_id,
+                Application.topic_id == next_pref.topic_id).first()
+            busy_priority = db.query(Application).filter(Application.student_id == application.student_id,
+                Application.priority == next_pref.rank, Application.status != "REJECTED").first()
+            if not existing and not busy_priority:
+                db.add(Application(student_id=application.student_id, topic_id=next_pref.topic_id,
+                    priority=next_pref.rank, motivation="Запасной приоритет после отклонения", status="SUBMITTED"))
+    application.updated_at = datetime.utcnow()
+    topic_name = (topic.title_ru or topic.title) if topic else (application.custom_title or "Тема")
+    log_audit(db, current_user.id, "APPLICATION_" + application.status,
+        f"Решение по заявке #{application.id}: {application.status}", ip_address=request.client.host if request.client else None)
+    create_notification(db, application.student_id, "Решение по заявке", f"Тема «{topic_name}»: {application.status}")
+    db.commit()
+    await ws_manager.send_to_user(application.student_id, {"event": "APPLICATION_STATUS_CHANGED",
+        "status": application.status, "topic_title": topic_name, "reason": application.reject_reason})
+    return {"message": "Решение зафиксировано", "status": application.status}
+
+# ─── Checkpoints & File Submissions ───────────────────────────────────────────
+@app.get("/api/checkpoints/{student_id}")
+def get_student_checkpoints(student_id: int, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)):
+    require_student_access(db, current_user, student_id)
+    ensure_student_checkpoints(db, student_id)
+    cps = db.query(Checkpoint).filter(Checkpoint.student_id == student_id).order_by(Checkpoint.stage.asc()).all()
+    accepted_count = sum(1 for c in cps if c.status == "ACCEPTED")
+    progress_percent = int((accepted_count / len(cps)) * 100) if cps else 0
+    return {
+        "student_id": student_id,
+        "progress_percent": progress_percent,
+        "checkpoints": [
+            {
+                "id": c.id,
+                "student_id": c.student_id,
+                "stage": c.stage,
+                "title": c.title,
+                "deadline": c.deadline,
+                "file_name": c.file_name,
+                "status": c.status or "NOT_SUBMITTED",
+                "review_comment": c.review_comment,
+                "updated_at": c.updated_at.strftime("%d.%m.%Y %H:%M") if c.updated_at else None,
+                "download_url": f"/api/checkpoints/download/{c.id}" if c.file_name else None
+            }
+            for c in cps
+        ]
+    }
+
+@app.get("/api/checkpoints")
+def get_checkpoints(
+    application_id: Optional[int] = None,
+    student_id: Optional[int] = None,
+    db: Session = Depends(get_db, scope="function"),
+    current_user: User = Depends(get_current_user)
+):
+    if student_id:
+        return get_student_checkpoints(student_id, db, current_user)
+    if application_id:
+        app_inst = db.query(Application).filter(Application.id == application_id).first()
+        if app_inst and app_inst.student_id:
+            return get_student_checkpoints(app_inst.student_id, db, current_user)
+    return []
+
+@app.post("/api/checkpoints/upload")
+async def upload_checkpoint_file(
+    checkpoint_id: int = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_role("student")),
+    db: Session = Depends(get_db, scope="function")
+):
+    # File safety checks: sanitize filename & prevent directory traversal
+    raw_name = file.filename or "report.pdf"
+    if ".." in raw_name or "/" in raw_name or "\\" in raw_name:
+        raise HTTPException(status_code=400, detail="Недопустимое имя файла")
+    orig_name = os.path.basename(raw_name)
+    ext = os.path.splitext(orig_name)[1].lower()
+    allowed_exts = [".pdf", ".docx", ".doc", ".zip", ".rar", ".txt"]
+    if ext not in allowed_exts:
+        raise HTTPException(status_code=400, detail=f"Недопустимый формат файла {ext}. Разрешены: {', '.join(allowed_exts)}")
+
+    cp = db.query(Checkpoint).filter(Checkpoint.id == checkpoint_id).first()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Контрольная точка не найдена")
+
+    owner_id = require_checkpoint_access(db, current_user, cp)
+
+    MAX_CHECKPOINT_SIZE = 20 * 1024 * 1024  # 20 MB
+    content = await file.read(MAX_CHECKPOINT_SIZE + 1)
+    if len(content) > MAX_CHECKPOINT_SIZE:
+        raise HTTPException(status_code=413, detail="Размер файла превышает допустимый лимит (20 МБ)")
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Загружаемый файл пуст")
+
+    if ext == ".docx":
+        validate_docx_archive(content)
+    elif ext == ".pdf" and not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=400, detail="Поврежденный PDF")
+    upload_dir = os.path.join(UPLOADS_DIR, "checkpoints")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    # Version tracking
+    last_submission = db.query(CheckpointSubmission).filter(
+        CheckpointSubmission.checkpoint_id == cp.id
+    ).order_by(CheckpointSubmission.version.desc()).first()
+    version = (last_submission.version + 1) if last_submission else 1
+
+    timestamp = int(datetime.utcnow().timestamp())
+    rand_token = secrets.token_hex(8)
+    saved_filename = f"cp_{cp.id}_v{version}_{timestamp}_{rand_token}{ext}"
+    file_path = os.path.abspath(os.path.join(upload_dir, saved_filename))
+
+    if os.path.commonpath([file_path, upload_dir]) != upload_dir:
+        raise HTTPException(status_code=400, detail="Недопустимый путь к файлу")
+
+    file_path = safe_upload_path(file_path)
+    with open(file_path, "xb") as buffer:
+        buffer.write(content)
+
+    try:
+        # Create submission record
+        sub = CheckpointSubmission(
+            checkpoint_id=cp.id,
+            student_id=owner_id,
+            file_name=orig_name,
+            file_path=file_path,
+            version=version,
+            submitted_at=datetime.utcnow(),
+            status="UNDER_REVIEW"
+        )
+        db.add(sub)
+    
+        # Update checkpoint
+        cp.file_name = saved_filename
+        cp.status = "UNDER_REVIEW"
+        cp.updated_at = datetime.utcnow()
+        db.flush()
+    
+        log_audit(db, cp.student_id, "CHECKPOINT_UPLOADED", f"Загружен отчет к этапу {cp.title} (версия {version})")
+    
+        db.commit()
+    except Exception:
+        db.rollback()
+        os.unlink(file_path)
+        raise
+    assigned = db.query(Application).filter(Application.student_id == owner_id, Application.status.in_(ASSIGNED_STATUSES)).first()
+    await send_workflow_event(db, owner_id, assigned.topic.supervisor_id if assigned and assigned.topic else None, {
+        "event": "CHECKPOINT_SUBMITTED",
+        "checkpoint_id": cp.id,
+        "student_id": cp.student_id,
+        "title": cp.title,
+        "version": version
+    })
+
+    return {
+        "message": "Отчет успешно загружен на проверку",
+        "checkpoint_id": cp.id,
+        "file_name": saved_filename,
+        "version": version,
+        "status": "UNDER_REVIEW",
+        "download_url": f"/api/checkpoints/download/{cp.id}"
+    }
+
+@app.post("/api/checkpoints/review")
+async def review_checkpoint(
+    req: CheckpointReviewSchema,
+    current_user: User = Depends(require_role("teacher", "head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+    if current_user and current_user.role not in ["teacher", "head", "admin"]:
+        raise HTTPException(status_code=403, detail="Только научные руководители и заведующие могут проверять отчеты")
+
+    cp = db.query(Checkpoint).filter(Checkpoint.id == req.checkpoint_id).first()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Контрольная точка не найдена")
+
+    require_checkpoint_access(db, current_user, cp)
+
+    if req.status not in ["ACCEPTED", "REVISION"]:
+        raise HTTPException(status_code=400, detail="Недопустимый статус. Разрешено: ACCEPTED, REVISION")
+
+    latest = db.query(CheckpointSubmission).filter(CheckpointSubmission.checkpoint_id == cp.id).order_by(CheckpointSubmission.version.desc()).first()
+    if not latest:
+        raise HTTPException(status_code=400, detail="Нельзя принимать этап без загруженного отчета")
+    cp.status = req.status
+    cp.review_comment = req.comment or ""
+    cp.updated_at = datetime.utcnow()
+
+    # Update latest submission
+    last_sub = db.query(CheckpointSubmission).filter(
+        CheckpointSubmission.checkpoint_id == cp.id
+    ).order_by(CheckpointSubmission.version.desc()).first()
+    if last_sub:
+        last_sub.status = req.status
+        last_sub.review_comment = req.comment or ""
+        last_sub.reviewed_by = current_user.id if current_user else None
+        last_sub.reviewed_at = datetime.utcnow()
+
+    db.flush()
+
+    rev_id = current_user.id if current_user else None
+    log_audit(db, rev_id, "CHECKPOINT_REVIEWED", f"Проверка этапа «{cp.title}»: {req.status}. Замечание: {req.comment or 'нет'}")
+
+    if cp.student_id:
+        create_notification(
+            db,
+            cp.student_id,
+            f"Контрольная точка {cp.title}",
+            f"Статус проверки: {req.status}. Комментарий руководителя: {req.comment or 'нет замечаний'}",
+            "success" if req.status == "ACCEPTED" else "warning"
+        )
+        db.commit()
+        await ws_manager.send_to_user(cp.student_id, {
+            "event": "CHECKPOINT_REVIEWED",
+            "checkpoint_id": cp.id,
+            "status": cp.status,
+            "title": cp.title,
+            "comment": cp.review_comment
+        })
+
+    return {
+        "message": "Результат проверки успешно сохранен",
+        "checkpoint_id": cp.id,
+        "status": cp.status,
+        "review_comment": cp.review_comment
+    }
+
+@app.get("/api/checkpoints/download/{checkpoint_id}")
+def download_checkpoint_file(checkpoint_id: int, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)):
+    require_checkpoint_access(db, current_user, db.get(Checkpoint, checkpoint_id))
+    cp = db.query(Checkpoint).filter(Checkpoint.id == checkpoint_id).first()
+    if not cp or not cp.file_name:
+        raise HTTPException(status_code=404, detail="Файл отчета не найден")
+
+    # Search in uploads/checkpoints or uploads with directory traversal checks
+    base_dir = UPLOADS_DIR
+    cp_dir = os.path.abspath(os.path.join(base_dir, "checkpoints"))
+
+    clean_file_name = os.path.basename(cp.file_name)
+    path_cp = os.path.abspath(os.path.join(cp_dir, clean_file_name))
+    path_root = os.path.abspath(os.path.join(base_dir, clean_file_name))
+    filepath = path_cp if os.path.exists(path_cp) else (path_root if os.path.exists(path_root) else None)
+
+    if not filepath or not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Файл на сервере не найден")
+
+    if os.path.commonpath([filepath, base_dir]) != base_dir:
+        raise HTTPException(status_code=403, detail="Доступ запрещен")
+
+    last_sub = db.query(CheckpointSubmission).filter(
+        CheckpointSubmission.checkpoint_id == cp.id
+    ).order_by(CheckpointSubmission.version.desc()).first()
+    clean_name = last_sub.file_name if last_sub and last_sub.file_name else clean_file_name
+
+    return FileResponse(safe_upload_path(filepath), filename=clean_name, media_type="application/octet-stream", headers={"X-Content-Type-Options": "nosniff"})
+
+@app.get("/api/checkpoints/{checkpoint_id}/history")
+def get_checkpoint_history(checkpoint_id: int, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)):
+    require_checkpoint_access(db, current_user, db.get(Checkpoint, checkpoint_id))
+    subs = db.query(CheckpointSubmission).filter(
+        CheckpointSubmission.checkpoint_id == checkpoint_id
+    ).order_by(CheckpointSubmission.version.desc()).all()
+
+    return [{
+        "id": s.id,
+        "version": s.version,
+        "file_name": s.file_name,
+        "submitted_at": s.submitted_at.strftime("%d.%m.%Y %H:%M"),
+        "status": s.status,
+        "review_comment": s.review_comment,
+        "reviewed_at": s.reviewed_at.strftime("%d.%m.%Y %H:%M") if s.reviewed_at else None
+    } for s in subs]
+
+@app.get("/api/teacher/checkpoints")
+def get_teacher_checkpoints(db: Session = Depends(get_db, scope="function"), current_user: User = Depends(require_role("teacher", "head", "admin"))):
+    cps = db.query(Checkpoint).filter(
+        Checkpoint.student_id.isnot(None),
+        Checkpoint.status.in_(["UNDER_REVIEW", "ACCEPTED", "REVISION"])
+    ).order_by(Checkpoint.updated_at.desc()).all()
+
+    result = []
+    for c in cps:
+        if current_user.role == "teacher":
+            owned = db.query(Application).join(Topic).filter(Application.student_id == c.student_id,
+                Application.status.in_(ASSIGNED_STATUSES), Topic.supervisor_id == current_user.id).first()
+            if not owned:
+                continue
+        student = c.student
+        topic_title = "—"
+        if student:
+            app_inst = db.query(Application).filter(Application.student_id == student.id).order_by(Application.id.desc()).first()
+            if app_inst:
+                topic_title = ((app_inst.topic.title_ru or app_inst.topic.title) if app_inst.topic else app_inst.custom_title) or "—"
+        result.append({
+            "id": c.id,
+            "student_id": c.student_id,
+            "student_name": student.full_name if student else f"Студент #{c.student_id}",
+            "student_email": student.email if student else "",
+            "topic_title": topic_title,
+            "stage": c.stage,
+            "title": c.title,
+            "deadline": c.deadline,
+            "file_name": c.file_name,
+            "status": c.status,
+            "review_comment": c.review_comment or "",
+            "updated_at": c.updated_at.strftime("%d.%m.%Y %H:%M") if c.updated_at else None,
+            "download_url": f"/api/checkpoints/download/{c.id}" if c.file_name else None
+        })
+    return result
+
+@app.post("/api/checkpoints/done")
+async def complete_checkpoint_legacy(req: CheckpointDoneSchema,
+    current_user: User = Depends(require_role("teacher", "head", "admin")), db: Session = Depends(get_db, scope="function")):
+    return await review_checkpoint(CheckpointReviewSchema(checkpoint_id=req.checkpoint_id, status="ACCEPTED"), current_user, db)
+
+# ─── Notifications Endpoints ──────────────────────────────────────────────────
+@app.get("/api/notifications")
+def get_user_notifications(current_user: User = Depends(get_current_user), db: Session = Depends(get_db, scope="function")):
+    notifs = db.query(Notification).filter(
+        Notification.user_id == current_user.id
+    ).order_by(Notification.created_at.desc()).limit(30).all()
+
+    return [{
+        "id": n.id,
+        "title": n.title,
+        "message": n.message,
+        "type": n.type,
+        "is_read": n.is_read,
+        "created_at": n.created_at.strftime("%d.%m.%Y %H:%M")
+    } for n in notifs]
+
+@app.post("/api/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db, scope="function")):
+    n = db.query(Notification).filter(Notification.id == notification_id, Notification.user_id == current_user.id).first()
+    if n:
+        n.is_read = True
+        db.commit()
+    return {"message": "Уведомление отмечено как прочитанное"}
+
+@app.post("/api/notifications/read-all")
+def mark_all_notifications_read(current_user: User = Depends(get_current_user), db: Session = Depends(get_db, scope="function")):
+    db.query(Notification).filter(Notification.user_id == current_user.id).update({"is_read": True})
+    db.commit()
+    return {"message": "Все уведомления прочитаны"}
+
+# ─── Gale-Shapley Stable Matching Algorithm ───────────────────────────────────
+@app.post("/api/allocation/gale-shapley")
+@app.post("/api/head/run-distribution")
+async def run_gale_shapley(
+    dry_run: Optional[bool] = Query(None),
+    apply: Optional[bool] = Query(None),
+    body: Optional[GaleShapleyRunSchema] = None,
+    current_user: User = Depends(require_role("head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+
+    is_dry_run = dry_run if dry_run is not None else (body.dry_run if body else False)
+    is_apply = apply if apply is not None else (body.apply if body else False)
+
+    if is_dry_run and is_apply:
+        raise HTTPException(status_code=400, detail="dry_run и apply несовместимы")
+    assigned_ids = {a.student_id for a in db.query(Application).filter(Application.status.in_(ASSIGNED_STATUSES))}
+    students = db.query(User).filter(User.role == "student", User.is_active.is_(True), ~User.id.in_(assigned_ids)).all()
+    topics = db.query(Topic).all()
+    topic_map = {t.id: t for t in topics}
+
+    quotas = {t.id: max(0, t.quota_total - t.quota_used) for t in topics}
+    matched: Dict[int, List[int]] = {t.id: [] for t in topics}
+
+    student_prefs: Dict[int, List[int]] = {}
+    preference_ranks = {}
+    for s in students:
+        prefs = db.query(Preference).filter(Preference.student_id == s.id).order_by(Preference.rank).all()
+        if prefs:
+            preference_ranks[s.id] = {p.topic_id: p.rank for p in prefs[:3]}
+            rejected = {a.topic_id for a in db.query(Application).filter(Application.student_id == s.id, Application.status == "REJECTED")}
+            student_prefs[s.id] = [p.topic_id for p in prefs[:3] if p.topic_id in topic_map and p.topic_id not in rejected]
+        else:
+            apps = db.query(Application).filter(Application.student_id == s.id, Application.topic_id.isnot(None), Application.status == "SUBMITTED").order_by(Application.priority).all()
+            if apps:
+                preference_ranks[s.id] = {a.topic_id: a.priority for a in apps[:3]}
+                student_prefs[s.id] = [a.topic_id for a in apps[:3] if a.topic_id in topic_map]
+            else:
+                student_prefs[s.id] = []
+
+    student_dict = {s.id: s for s in students}
+    # Deterministic sorting: sort free students by GPA descending, then student_id ascending
+    free_students = sorted(list(student_prefs.keys()), key=lambda sid: (-float(student_dict[sid].gpa if student_dict[sid].gpa is not None else 3.5), sid))
+    proposals_index = {s_id: 0 for s_id in free_students}
+    protocol = []
+    fallback_transfers = []
+
+    iteration = 0
+    while free_students:
+        iteration += 1
+        s_id = free_students.pop(0)
+        p_idx = proposals_index[s_id]
+
+        if p_idx >= len(student_prefs[s_id]):
+            protocol.append({
+                "student": student_dict[s_id].full_name,
+                "gpa": student_dict[s_id].gpa,
+                "result": "Не распределен (исчерпаны приоритеты)",
+                "reason": "Все выбранные студентом темы заполнили квоты более высокорейтинговыми кандидатами"
+            })
+            continue
+
+        desired_topic_id = student_prefs[s_id][p_idx]
+        proposals_index[s_id] += 1
+        current_matched = matched[desired_topic_id]
+        capacity = quotas[desired_topic_id]
+        topic_title = topic_map[desired_topic_id].title_ru or topic_map[desired_topic_id].title
+
+        if capacity <= 0:
+            free_students.append(s_id)
+            continue
+        if len(current_matched) < capacity:
+            current_matched.append(s_id)
+            if p_idx > 0:
+                fallback_transfers.append({
+                    "student": student_dict[s_id].full_name,
+                    "gpa": student_dict[s_id].gpa,
+                    "target_topic": topic_title,
+                    "priority_level": p_idx + 1,
+                    "reason": f"Переведен на запасной приоритет №{p_idx + 1}"
+                })
+            protocol.append({
+                "student": student_dict[s_id].full_name,
+                "gpa": student_dict[s_id].gpa,
+                "topic": topic_title,
+                "result": f"Назначен (приоритет {p_idx + 1})",
+                "reason": f"Квота свободна ({len(current_matched)}/{capacity})"
+            })
+        else:
+            # Sort current contenders by GPA ascending, tie-breaker: larger student_id is displaced first
+            current_matched.sort(key=lambda x: (float(student_dict[x].gpa if student_dict[x].gpa is not None else 3.5), -x))
+            worst_student_id = current_matched[0]
+
+            cand_score = (float(student_dict[s_id].gpa if student_dict[s_id].gpa is not None else 3.5), -s_id)
+            worst_score = (float(student_dict[worst_student_id].gpa if student_dict[worst_student_id].gpa is not None else 3.5), -worst_student_id)
+
+            if cand_score > worst_score:
+                current_matched.pop(0)
+                current_matched.append(s_id)
+                free_students.append(worst_student_id)
+
+                displaced = student_dict[worst_student_id]
+                protocol.append({
+                    "student": student_dict[s_id].full_name,
+                    "gpa": student_dict[s_id].gpa,
+                    "topic": topic_title,
+                    "result": f"Зачислен по конкурсу баллов (вытеснил {displaced.full_name} с GPA {displaced.gpa})",
+                    "reason": "Более высокий академический рейтинг GPA или детерминированный tie-break"
+                })
+            else:
+                free_students.append(s_id)
+                protocol.append({
+                    "student": student_dict[s_id].full_name,
+                    "gpa": student_dict[s_id].gpa,
+                    "topic": topic_title,
+                    "result": "Отклонен темой (конкурс баллов)",
+                    "reason": f"Текущие кандидаты имеют более высокий рейтинг"
+                })
+
+    allocated_list = []
+    first_p = 0
+    second_p = 0
+    third_p = 0
+
+    allocated_student_ids = set()
+    for t_id, s_ids in matched.items():
+        t = topic_map[t_id]
+        for sid in s_ids:
+            st = student_dict[sid]
+            allocated_student_ids.add(sid)
+            prefs = student_prefs.get(sid, [])
+            pref_rank = preference_ranks.get(sid, {}).get(t_id, (prefs.index(t_id) + 1) if t_id in prefs else 1)
+            if pref_rank == 1:
+                first_p += 1
+            elif pref_rank == 2:
+                second_p += 1
+            elif pref_rank == 3:
+                third_p += 1
+
+            allocated_list.append({
+                "student_id": sid,
+                "student_name": st.full_name,
+                "gpa": st.gpa,
+                "topic_id": t_id,
+                "topic_title": t.title_ru or t.title,
+                "supervisor_name": t.supervisor_name,
+                "priority_assigned": pref_rank
+            })
+
+    unallocated_list = []
+    for sid in student_dict:
+        if sid not in allocated_student_ids:
+            st = student_dict[sid]
+            unallocated_list.append({
+                "student_id": sid,
+                "student_name": st.full_name,
+                "gpa": st.gpa
+            })
+
+    students_total = len(students)
+    alloc_count = len(allocated_list)
+    unalloc_count = len(unallocated_list)
+    satisfaction = round((alloc_count / students_total * 100), 1) if students_total else 0.0
+
+    stats = {
+        "students_total": students_total,
+        "allocated": alloc_count,
+        "unallocated": unalloc_count,
+        "first_priority": first_p,
+        "second_priority": second_p,
+        "third_priority": third_p,
+        "satisfaction_percent": satisfaction
+    }
+
+    # Commit if apply=True and not dry_run
+    if is_apply and not is_dry_run:
+        for t_id, s_ids in matched.items():
+            if not s_ids:
+                continue
+            updated = db.execute(text("UPDATE topics SET quota_used=quota_used+:n, status=CASE WHEN quota_used+:n>=quota_total THEN 'full' ELSE 'available' END WHERE id=:id AND quota_used+:n<=quota_total"), {"n": len(s_ids), "id": t_id})
+            if updated.rowcount != 1:
+                raise HTTPException(status_code=409, detail="TOPIC_FULL: Квота изменилась")
+            for sid in s_ids:
+                application = db.query(Application).filter(Application.student_id == sid, Application.topic_id == t_id).first()
+                if application is None:
+                    application = Application(student_id=sid, topic_id=t_id,
+                        priority=preference_ranks[sid][t_id], motivation="Распределение Гейла–Шепли", status="ALLOCATED")
+                    db.add(application)
+                elif application.status == "SUBMITTED":
+                    application.status = "ALLOCATED"
+                else:
+                    raise HTTPException(status_code=409, detail="Состояние заявки изменилось")
+                db.query(Application).filter(Application.student_id == sid, Application.topic_id != t_id,
+                    Application.status == "SUBMITTED").update({Application.status: "REJECTED", Application.reject_reason: "Распределена другая тема"})
+                db.flush()
+        user_id = current_user.id if current_user else None
+        log_audit(db, user_id, "GALE_SHAPLEY_COMMITTED", f"Применено распределение Гейла-Шепли: распределено {alloc_count}/{students_total} студентов")
+        db.commit()
+        await ws_manager.broadcast({
+            "event": "DISTRIBUTION_FINISHED",
+            "message": "🎯 Кафедра завершила автоматическое распределение тем!"
+        })
+    return {
+        "allocated": allocated_list,
+        "unallocated": unallocated_list,
+        "stats": stats,
+        "status": "success",
+        "message": f"Распределение Гейла–Шепли {'применено' if (is_apply and not is_dry_run) else 'рассчитано в режиме предварительного просмотра (dry_run)'}",
+        "assigned_pairs": allocated_list,
+        "fallback_transfers": fallback_transfers,
+        "protocol": protocol,
+        "assigned_count": alloc_count,
+        "total_students": students_total
+    }
+
+# ─── Head of Department: Stats, Confirmation & Reports ───────────────────────
+@app.get("/api/head/stats")
+def get_head_stats(
+    current_user: User = Depends(require_role("head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+    total_students = db.query(User).filter(User.role == "student", User.is_active == True).count()
+    approved_count = db.query(Application).filter(Application.status.in_(["APPROVED", "CONFIRMED_BY_HEAD", "ALLOCATED"])).count()
+    confirmed_count = db.query(Application).filter(Application.status == "CONFIRMED_BY_HEAD").count()
+
+    assigned_students = db.query(Application.student_id).filter(
+        Application.status.in_(["APPROVED", "CONFIRMED_BY_HEAD", "ALLOCATED"])
+    ).distinct().count()
+    without_topic = max(0, total_students - assigned_students)
+
+    topics = db.query(Topic).all()
+    total_quota = sum(t.quota_total for t in topics)
+    used_quota = sum(t.quota_used for t in topics)
+    free_quota = max(0, total_quota - used_quota)
+
+    # Supervisor load
+    supervisors_res = db.query(Topic.supervisor_name).distinct().all()
+    supervisor_load = []
+    for (s_name,) in supervisors_res:
+        if s_name:
+            s_topics = db.query(Topic).filter(Topic.supervisor_name == s_name).all()
+            q_tot = sum(t.quota_total for t in s_topics)
+            q_usd = sum(t.quota_used for t in s_topics)
+            supervisor_load.append({
+                "supervisor_name": s_name,
+                "used": q_usd,
+                "total": q_tot
+            })
+
+    # Categories statistics
+    cats = db.query(Topic.category, func.count(Topic.id)).group_by(Topic.category).all()
+    categories_stats = {c: count for c, count in cats if c}
+
+    active_order = db.query(OfficialOrder).order_by(OfficialOrder.id.asc()).first()
+    active_order_data = None
+    if active_order:
+        active_order_data = {
+            "id": active_order.id,
+            "order_number": active_order.order_number,
+            "academic_year": active_order.academic_year,
+            "verification_code": active_order.verification_code,
+            "document_hash": active_order.document_hash or "",
+            "date": active_order.created_at.strftime("%d.%m.%Y") if active_order.created_at else "11.10.2026",
+            "created_at": active_order.created_at.isoformat() if active_order.created_at else ""
+        }
+
+    return {
+        "students_total": total_students,
+        "confirmed": confirmed_count,
+        "pending": approved_count - confirmed_count,
+        "without_topic": without_topic,
+        "available_slots": free_quota,
+        "used_slots": used_quota,
+        "supervisor_load": supervisor_load,
+        "categories": categories_stats,
+        "active_order": active_order_data,
+        # Backward compatibility keys
+        "total_students": total_students,
+        "approved_by_teachers": approved_count,
+        "confirmed_by_head": confirmed_count,
+        "pending_students": without_topic,
+        "total_quota": total_quota,
+        "total_quota_left": free_quota,
+        "completion_rate": round((approved_count / total_students * 100), 1) if total_students else 0.0
+    }
+
+@app.post("/api/head/confirm-all")
+def confirm_all_applications(
+    request: Request,
+    current_user: User = Depends(require_role("head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+    ip = request.client.host if request.client else "127.0.0.1"
+    # 4. confirm-all НЕ должен подтверждать SUBMITTED.
+    # 5. Head подтверждает только заявки, уже согласованные teacher.
+    apps = db.query(Application).filter(Application.status.in_(["APPROVED", "SUPERVISOR_APPROVED"])).all()
+    for candidate in apps:
+        if db.query(Application).filter(Application.student_id == candidate.student_id,
+            Application.id != candidate.id, Application.status.in_(ASSIGNED_STATUSES)).first():
+            raise HTTPException(status_code=409, detail="У студента несколько назначений; требуется проверка данных")
+    count = len(apps)
+    for a in apps:
+        a.status = "CONFIRMED_BY_HEAD"
+        a.updated_at = datetime.utcnow()
+        # 9. При финальном назначении одной темы остальные заявки студента должны корректно закрываться.
+        other_pending = db.query(Application).filter(
+            Application.student_id == a.student_id,
+            Application.id != a.id,
+            Application.status == "SUBMITTED"
+        ).all()
+        for op in other_pending:
+            op.status = "REJECTED"
+            op.reject_reason = f"Студент получил финальное утверждение по теме #{a.topic_id or a.id}"
+            op.updated_at = datetime.utcnow()
+    db.flush()
+
+    active_order = db.query(OfficialOrder).order_by(OfficialOrder.id.asc()).first()
+    if active_order and active_order.status == "DRAFT":
+        sync_order_items(active_order, db)
+
+    log_audit(db, current_user.id, "CONFIRM_ALL", f"Массовое утверждение приказа: утверждено {count} тем", user_email=current_user.email, ip_address=ip)
+    return {"message": f"Финально утверждено {count} тем дипломных проектов", "count": count}
+
+@app.get("/api/teachers/load")
+def get_teachers_load(db: Session = Depends(get_db, scope="function"), current_user: User = Depends(require_role("teacher", "head", "admin"))):
+    supervisors = db.query(Topic.supervisor_name).distinct().all()
+    results = []
+    for (s_name,) in supervisors:
+        if s_name:
+            s_topics = db.query(Topic).filter(Topic.supervisor_name == s_name).all()
+            q_total = sum(t.quota_total for t in s_topics)
+            q_used = sum(t.quota_used for t in s_topics)
+            pct = round((q_used / q_total * 100), 1) if q_total else 0
+            color = "green" if pct < 60 else ("yellow" if pct <= 90 else "red")
+            results.append({
+                "supervisor_name": s_name,
+                "quota_total": q_total,
+                "quota_used": q_used,
+                "load_percent": pct,
+                "status_color": color,
+                "avg_response_hours": 18
+            })
+    results.sort(key=lambda x: x["load_percent"], reverse=True)
+    return results
+
+@app.get("/api/risks")
+def get_risks(db: Session = Depends(get_db, scope="function"), current_user: User = Depends(require_role("head", "admin"))):
+    three_days_ago = datetime.utcnow() - timedelta(days=3)
+    stale_apps = db.query(Application).filter(Application.status == "SUBMITTED", Application.created_at <= three_days_ago).all()
+
+    all_students = db.query(User).filter(User.role == "student", User.is_active == True).all()
+    assigned_ids = [a.student_id for a in db.query(Application).filter(Application.status.in_(["APPROVED", "CONFIRMED_BY_HEAD", "ALLOCATED"])).all()]
+    unassigned_students = [s for s in all_students if s.id not in assigned_ids]
+
+    overdue_cps = db.query(Checkpoint).filter(Checkpoint.status == "NOT_SUBMITTED").all()
+
+    return {
+        "stale_applications": [{
+            "id": a.id,
+            "student_name": a.student.full_name if a.student else "",
+            "topic_title": (a.topic.title_ru or a.topic.title) if a.topic else a.custom_title,
+            "supervisor": a.topic.supervisor_name if a.topic else "—",
+            "days_waiting": (datetime.utcnow() - a.created_at).days if a.created_at else 0
+        } for a in stale_apps],
+        "unassigned_students": [{
+            "id": s.id,
+            "full_name": s.full_name,
+            "email": s.email,
+            "rating": s.gpa
+        } for s in unassigned_students],
+        "overdue_checkpoints_count": len(overdue_cps)
+    }
+
+# ─── Documents: Export DOCX & PDF Official Orders ─────────────────────────────
+KZ_TOPIC_TRANSLATIONS = {
+    "Разработка веб-платформы автоматизации распределения дипломных работ": "Дипломдық жұмыстарды бөлуді автоматтандыруға арналған веб-платформаны әзірлеу",
+    "Система детекции дефектов печатных плат на основе Computer Vision": "Computer Vision негізінде баспалық төлемдер ақауларын анықтау жүйесі",
+    "IoT-система мониторинга микроклимата серверных помещений на базе LoRaWAN": "LoRaWAN негізінде серверлік бөлмелердің микроклиматын бақылауға арналған IoT-жүйесі",
+    "Анализ и обнаружение аномалий сетевого трафика методами машинного обучения": "Машиналық оқыту әдістері арқылы желілік трафик аномалияларын талдау және анықтау",
+    "Микросервисная платформа учета академической успеваемости студентов": "Студенттердің академиялық үлгерімін есепке алуға арналған микросервистік платформа",
+    "Интеллектуальный ассистент технической поддержки для корпоративного сектора": "Корпоративтік сектор үшін техникалық қолдаудың зияткерлік ассистенті",
+}
+
+def sync_order_items(order: OfficialOrder, db: Session) -> list[OrderItem]:
+    """Синхронизирует набор OrderItem приказа OfficialOrder из подтвержденных заявок"""
+    if order.status in ("SIGNED", "ACTIVE"):
+        if not order.items:
+            raise HTTPException(status_code=409, detail="Подписанный приказ не содержит зафиксированных строк")
+        return order.items
+    apps = db.query(Application).join(Topic).filter(
+        Application.status == "CONFIRMED_BY_HEAD", Topic.academic_year == order.academic_year
+    ).order_by(Application.id.asc()).all()
+
+    seen_students = set()
+    unique_apps = []
+    for a in apps:
+        if a.student_id not in seen_students:
+            seen_students.add(a.student_id)
+            unique_apps.append(a)
+
+    # Never fabricate unapproved assignments when there are no confirmed applications.
+    order.document_hash = ""
+
+    # Remove old items for this order
+    db.query(OrderItem).filter(OrderItem.order_id == order.id).delete()
+    db.flush()
+
+    for idx, a in enumerate(unique_apps, start=1):
+        rus_title = (a.topic.title_ru or a.topic.title) if a.topic else (a.custom_title or "Дипломный проект")
+        kaz_title = (a.topic.title_kz if (a.topic and a.topic.title_kz) else None) or KZ_TOPIC_TRANSLATIONS.get(rus_title, f"{rus_title} (қаз)")
+        group_name = (a.student.group_name if (a.student and a.student.group_name) else ("ВТ-22-1K" if idx % 2 == 1 else "ВТ-22-2R"))
+
+        supervisor_raw = (a.topic.supervisor_name if a.topic and a.topic.supervisor_name else "Доц. Ахметов К.А.")
+        if "Ахметов" in supervisor_raw:
+            supervisor_full = "к.т.н., доцент Ахметов К.А."
+        elif "Касымов" in supervisor_raw:
+            supervisor_full = "д.т.н., профессор Касымов А.Б."
+        elif "ТехноСервис" in supervisor_raw:
+            supervisor_full = "Индустриалды жетекші (ТОО «ТехноСервис»)"
+        elif not any(deg in supervisor_raw for deg in ["проф", "доц", "к.т.н", "д.т.н", "PhD", "доцент", "профессор"]):
+            supervisor_full = f"доцент {supervisor_raw}"
+        else:
+            supervisor_full = supervisor_raw
+
+        student_name = a.student.full_name if a.student else f"Студент #{a.student_id}"
+
+        item = OrderItem(
+            order_id=order.id,
+            student_id=a.student_id,
+            topic_id=a.topic_id,
+            supervisor_id=a.topic.supervisor_id if a.topic else None,
+            student_name=student_name,
+            group_name=group_name,
+            topic_title_ru=rus_title,
+            topic_title_kz=kaz_title,
+            supervisor_name=supervisor_full
+        )
+        db.add(item)
+
+    db.flush()
+    db.expire(order, ["items"])
+    return order.items
+
+def get_or_sync_official_order(
+    db: Session,
+    order_code: Optional[str] = None,
+    order_id: Optional[int] = None
+) -> OfficialOrder:
+    """Возвращает OfficialOrder и гарантирует единый источник данных для DOCX и PDF"""
+    if not isinstance(order_code, str) or not order_code.strip():
+        order_code = None
+    if not isinstance(order_id, int):
+        order_id = None
+
+    if order_code:
+        order = db.query(OfficialOrder).filter(OfficialOrder.verification_code == order_code).first()
+    elif order_id:
+        order = db.query(OfficialOrder).filter(OfficialOrder.id == order_id).first()
+    else:
+        order = db.query(OfficialOrder).order_by(OfficialOrder.id.asc()).first()
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Приказ не найден")
+    if order.status == "DRAFT":
+        sync_order_items(order, db)
+    elif not order.items or not order.created_at:
+        raise HTTPException(status_code=409, detail="Неполный подписанный приказ; требуется проверка реестра")
+
+    return order
+
+@app.get("/api/export/official-decree-docx")
+def export_official_decree_docx(
+    order_id: Optional[int] = Query(None),
+    order_code: Optional[str] = Query(None),
+    current_user: User = Depends(require_role("head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+    order = get_or_sync_official_order(db, order_code=order_code, order_id=order_id)
+    items = db.query(OrderItem).filter(OrderItem.order_id == order.id).order_by(OrderItem.id.asc()).all()
+    if not items:
+        items = sync_order_items(order, db)
+
+    doc = docx.Document()
+    for section in doc.sections:
+        section.top_margin = Inches(0.7)
+        section.bottom_margin = Inches(0.7)
+        section.left_margin = Inches(0.8)
+        section.right_margin = Inches(0.8)
+
+    p_hdr = doc.add_paragraph()
+    p_hdr.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r1 = p_hdr.add_run(
+        "ҚАЗАҚСТАН РЕСПУБЛИКАСЫ ҒЫЛЫМ ЖӘНЕ ЖОҒАРЫ БІЛІМ МИНИСТРЛІГІ\n"
+        "МИНИСТЕРСТВО НАУКИ И ВЫСШЕГО ОБРАЗОВАНИЯ РЕСПУБЛИКИ КАЗАХСТАН\n"
+    )
+    r1.bold = True
+    r1.font.name = "Times New Roman"
+    r1.font.size = Pt(11)
+
+    p_prikaz = doc.add_paragraph()
+    p_prikaz.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    ord_num = order.order_number or "104-ОД"
+    r2 = p_prikaz.add_run(f"БҰЙРЫҚ / ПРИКАЗ № {ord_num}\n")
+    r2.bold = True
+    r2.font.name = "Times New Roman"
+    r2.font.size = Pt(13)
+
+    order_date = order.created_at.strftime("%d.%m.%Y") if order.created_at else "11.10.2026"
+    p_meta = doc.add_paragraph()
+    p_meta.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    r_meta = p_meta.add_run(
+        f"« {order_date} » ж./г.                                                                         г. Алматы / Алматы қ."
+    )
+    r_meta.font.name = "Times New Roman"
+    r_meta.font.size = Pt(10)
+
+    acad_year = order.academic_year or "2026–2027"
+    p_pre = doc.add_paragraph()
+    p_pre.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    r_pre = p_pre.add_run(
+        "Об утверждении тем дипломных проектов (работ) и назначении научных руководителей студентам "
+        "4 курса образовательной программы 6B06101 – «Вычислительная техника и программное обеспечение» "
+        f"на {acad_year} учебный год\n\n"
+        "В соответствии с Академической политикой университета и учебным планом подготовки бакалавров, "
+        "ПРИКАЗЫВАЮ:\n"
+        "1. Утвердить темы дипломных проектов (работ) и назначить научных руководителей следующим студентам выпускного курса:"
+    )
+    r_pre.font.name = "Times New Roman"
+    r_pre.font.size = Pt(10.5)
+
+    table = doc.add_table(rows=1, cols=7)
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    headers = [
+        "№",
+        "ФИО студента",
+        "Группа",
+        "Тақырыбы (қаз)",
+        "Тема работы (рус)",
+        "Научный руководитель (ФИО, степень)",
+        "Подпись"
+    ]
+    hdr_cells = table.rows[0].cells
+    for i, h in enumerate(headers):
+        hdr_cells[i].text = h
+        for p in hdr_cells[i].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.name = "Times New Roman"
+                run.font.size = Pt(9.5)
+
+    for idx, item in enumerate(items, start=1):
+        row_cells = table.add_row().cells
+        rus_title = item.topic_title_ru
+        kaz_title = item.topic_title_kz or KZ_TOPIC_TRANSLATIONS.get(rus_title, f"{rus_title} (қаз)")
+        group_name = item.group_name or "ВТиПО-22-1"
+        supervisor_full = item.supervisor_name
+
+        row_cells[0].text = str(idx)
+        row_cells[1].text = item.student_name
+        row_cells[2].text = group_name
+        row_cells[3].text = kaz_title
+        row_cells[4].text = rus_title
+        row_cells[5].text = supervisor_full
+        row_cells[6].text = "________"
+
+        for c_i, c in enumerate(row_cells):
+            for p in c.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if c_i in [0, 2, 6] else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.name = "Times New Roman"
+                    run.font.size = Pt(9)
+
+    col_widths = [Inches(0.4), Inches(1.3), Inches(0.8), Inches(1.6), Inches(1.6), Inches(1.3), Inches(0.6)]
+    for row in table.rows:
+        for idx_w, width in enumerate(col_widths):
+            row.cells[idx_w].width = width
+
+    p_ctrl = doc.add_paragraph()
+    r_ctrl = p_ctrl.add_run(
+        "\n2. Контроль за своевременным и качественным выполнением дипломных проектов (работ) "
+        "возложить на заведующего кафедрой ВТиПО Касымова А.Б."
+    )
+    r_ctrl.font.name = "Times New Roman"
+    r_ctrl.font.size = Pt(10.5)
+
+    p_sign = doc.add_paragraph()
+    p_sign.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    r_sign = p_sign.add_run(
+        "\n\nЗаведующий кафедрой ВТиПО,\n"
+        "д.т.н., профессор ____________ Касымов А.Б.\n"
+    )
+    r_sign.bold = True
+    r_sign.font.name = "Times New Roman"
+    r_sign.font.size = Pt(11)
+
+    p_reg = doc.add_paragraph()
+    p_reg.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r_reg = p_reg.add_run(
+        f"\nДокумент зарегистрирован в электронном реестре META. Код верификации: {order.verification_code}\n"
+        f"Ссылка для онлайн-проверки подлинности: {BASE_URL}/verify/{order.verification_code}"
+    )
+    r_reg.font.name = "Times New Roman"
+    r_reg.font.size = Pt(8.5)
+    r_reg.font.italic = True
+
+    bio = BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+
+    clean_num = (ord_num or "104_OD").replace("ОД", "OD").replace("од", "od").replace(" ", "_").replace("/", "_")
+    clean_num = "".join(c for c in clean_num if c.isascii() and (c.isalnum() or c in "_-")) or "104_OD"
+    filename = f"Prikaz_MON_RK_{clean_num}_{order.verification_code}.docx"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+def build_order_pdf_bytes(order: OfficialOrder, db: Session) -> bytes:
+    font_reg, font_bold = init_pdf_fonts()
+    verify_url = f"{BASE_URL}/verify/{order.verification_code}"
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=5,
+        border=1,
+    )
+    qr.add_data(verify_url)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="#0f172a", back_color="white")
+    qr_buffer = BytesIO()
+    qr_img.save(qr_buffer, format="PNG")
+    qr_buffer.seek(0)
+
+    pdf_buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        pdf_buffer,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+
+    title_style = ParagraphStyle(
+        'DocTitle',
+        fontName=font_bold,
+        fontSize=12,
+        leading=15,
+        alignment=1,
+        textColor=colors.HexColor('#0f172a')
+    )
+    subtitle_style = ParagraphStyle(
+        'DocSubtitle',
+        fontName=font_reg,
+        fontSize=8,
+        leading=11,
+        alignment=1,
+        textColor=colors.HexColor('#334155')
+    )
+    body_style = ParagraphStyle(
+        'DocBody',
+        fontName=font_reg,
+        fontSize=8,
+        leading=11,
+        alignment=4,
+        textColor=colors.HexColor('#1e293b')
+    )
+    cell_style = ParagraphStyle(
+        'TableCell',
+        fontName=font_reg,
+        fontSize=7.5,
+        leading=9.5,
+        textColor=colors.HexColor('#1e293b')
+    )
+    status_cell_style = ParagraphStyle(
+        'StatusCell',
+        fontName=font_reg,
+        fontSize=7.5,
+        leading=9.5,
+        alignment=1,
+        textColor=colors.HexColor('#059669')
+    )
+    header_cell_style = ParagraphStyle(
+        'TableHeader',
+        fontName=font_bold,
+        fontSize=7.5,
+        leading=9.5,
+        textColor=colors.white
+    )
+
+    story = []
+
+    # 1. Bilingual Header with QR Code
+    hdr_text = (
+        "<b>ҚАЗАҚСТАН РЕСПУБЛИКАСЫ ҒЫЛЫМ ЖӘНЕ ЖОҒАРЫ БІЛІМ МИНИСТРЛІГІ</b><br/>"
+        "МИНИСТЕРСТВО НАУКИ И ВЫСШЕГО ОБРАЗОВАНИЯ РЕСПУБЛИКИ КАЗАХСТАН<br/>"
+        "<b>«ЕСЕПТЕУ ТЕХНИКАСЫ ЖӘНЕ БАҒДАРЛАМАЛЫҚ ҚАМТАМАСЫЗ ЕТУ» КАФЕДРАСЫ</b><br/>"
+        "КАФЕДРА «ВЫЧИСЛИТЕЛЬНАЯ ТЕХНИКА И ПРОГРАММНОЕ ОБЕСПЕЧЕНИЕ»<br/>"
+        "<font size=6.5 color='#64748b'>META 2026 АКАДЕМИЯЛЫҚ АҚПАРАТТЫҚ ПЛАТФОРМАСЫ</font>"
+    )
+    hdr_table = Table([
+        [Paragraph(hdr_text, subtitle_style), RLImage(qr_buffer, width=65, height=65)]
+    ], colWidths=[440, 80])
+    hdr_table.setStyle(TableStyle([
+        ('FONTNAME', (0,0), (-1,-1), font_reg),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('ALIGN', (1,0), (1,0), 'RIGHT'),
+    ]))
+    story.append(hdr_table)
+    story.append(Spacer(1, 12))
+
+    # 2. Title & Date
+    ord_num = order.order_number or "104-ОД"
+    story.append(Paragraph(f"<b>Б Ұ Й Р Ы Қ  /  П Р И К А З  № {escape(str(ord_num))}</b>", title_style))
+    story.append(Spacer(1, 4))
+
+    order_date = order.created_at.strftime('%d.%m.%Y') if order.created_at else "11.10.2026"
+    story.append(Paragraph(
+        f"Алматы қ. / г. Алматы &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; «{order_date}» ж. / г.<br/>"
+        "<i>«ВТиПО мамандығы бітірушілерінің дипломдық жобалары тақырыптары мен ғылыми жетекшілерін бекіту туралы /<br/>"
+        "Об утверждении тем дипломных проектов и научных руководителей выпускников специальности ВТиПО»</i>",
+        subtitle_style
+    ))
+    story.append(Spacer(1, 10))
+
+    # 3. Introductory text
+    acad_year = order.academic_year or "2026-2027"
+    story.append(Paragraph(
+        f"Кафедра шешімдері мен Гейл–Шепли автоматтандырылған бөлу хаттамасы негізінде ({acad_year} оқу жылы), "
+        "<b>БҰЙРЫҚ ЕТЕМІН / ПРИКАЗЫВАЮ:</b> бітіруші курс студенттеріне келесі дипломдық жобалар тақырыптары мен ғылыми жетекшілерін бекіту:",
+        body_style
+    ))
+    story.append(Spacer(1, 8))
+
+    # 4. Table rows
+    table_rows = [
+        [
+            Paragraph("№", header_cell_style),
+            Paragraph("Білім алушының Т.А.Ә. / GPA<br/>ФИО Студента", header_cell_style),
+            Paragraph("Дипломдық жоба тақырыбы (қаз / рус)<br/>Тема дипломного проекта", header_cell_style),
+            Paragraph("Ғылыми жетекші<br/>Научный руководитель", header_cell_style),
+            Paragraph("Күйі<br/>Статус", header_cell_style)
+        ]
+    ]
+
+    items = db.query(OrderItem).filter(OrderItem.order_id == order.id).order_by(OrderItem.id.asc()).all()
+    if not items:
+        items = sync_order_items(order, db)
+
+    for idx, item in enumerate(items, start=1):
+        s_name = item.student_name
+        t_ru = item.topic_title_ru
+        t_kz = item.topic_title_kz or KZ_TOPIC_TRANSLATIONS.get(t_ru, f"{escape(str(t_ru))} (қаз)")
+        sup_name = item.supervisor_name
+        group_name = item.group_name or "ВТиПО-22-1"
+
+        table_rows.append([
+            Paragraph(str(idx), cell_style),
+            Paragraph(f"<b>{escape(str(s_name))}</b><br/><font color='#6366f1'>{escape(str(group_name))}</font>", cell_style),
+            Paragraph(f"<b>{escape(str(t_kz))}</b><br/><font color='#475569'><i>{escape(str(t_ru))}</i></font>", cell_style),
+            Paragraph(escape(sup_name), cell_style),
+            Paragraph("<b>Бекітілді<br/>Утверждено</b>", status_cell_style)
+        ])
+
+    table = Table(table_rows, colWidths=[22, 120, 200, 105, 75], repeatRows=1)
+    table.setStyle(TableStyle([
+        ('FONTNAME', (0,0), (-1,-1), font_reg),
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0f172a')),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f8fafc')]),
+        ('TOPPADDING', (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 15))
+
+    # 5. Signatures (Honest wording, NO EDS)
+    sig_data = [
+        [
+            Paragraph("<b>ВТиПО кафедрасының меңгерушісі / Заведующий кафедрой:</b><br/>т.ғ.д., профессор Қасымов А.Б.", cell_style),
+            Paragraph("Қолы / Подпись: __________________<br/><font size=7 color='#64748b'>М.О. / М.П. Документ зарегистрирован в реестре META</font>", cell_style)
+        ]
+    ]
+    sig_table = Table(sig_data, colWidths=[320, 202])
+    sig_table.setStyle(TableStyle([
+        ('FONTNAME', (0,0), (-1,-1), font_reg),
+    ]))
+
+    closing_elements = [
+        sig_table,
+        Spacer(1, 12),
+        Paragraph(
+            f"<font size=7 color='#64748b'>Документ зарегистрирован в электронном реестре META (код: <b>{escape(order.verification_code)}</b>). "
+            f"Для онлайн-проверки подлинности отсканируйте QR-код или перейдите по ссылке: "
+            f"<font color='#2563eb'>{escape(verify_url)}</font></font>",
+            subtitle_style
+        )
+    ]
+    story.append(KeepTogether(closing_elements))
+
+    doc.build(story, canvasmaker=UnicodeCanvas)
+    return pdf_buffer.getvalue()
+
+def ensure_order_pdf(order: OfficialOrder, db: Session, force: bool = False) -> tuple[str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", order.verification_code):
+        raise HTTPException(status_code=409, detail="Недопустимый код приказа")
+    os.makedirs(ORDERS_DIR, exist_ok=True)
+    pdf_path = safe_upload_path(os.path.join(ORDERS_DIR, f"order_{order.verification_code}.pdf"))
+    has_hash = bool(order.document_hash and re.fullmatch(r"[0-9a-fA-F]{64}", order.document_hash))
+    if os.path.isfile(pdf_path) and has_hash:
+        disk_hash = hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
+        if disk_hash == order.document_hash.lower() and not force:
+            return pdf_path, disk_hash
+        if order.status in ("SIGNED", "ACTIVE"):
+            raise HTTPException(status_code=409, detail="Контрольная сумма подписанного приказа не совпадает")
+    if order.status in ("SIGNED", "ACTIVE"):
+        raise HTTPException(status_code=409, detail="Подписанный PDF отсутствует; требуется восстановление оригинала")
+    pdf_bytes = build_order_pdf_bytes(order, db)
+    digest = hashlib.sha256(pdf_bytes).hexdigest()
+    fd, temporary = tempfile.mkstemp(dir=ORDERS_DIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(pdf_bytes)
+        os.replace(temporary, pdf_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    order.document_hash = digest
+    db.commit()
+    return pdf_path, digest
+
+@app.get("/api/export/pdf-order")
+def export_pdf_order(
+    order_id: Optional[int] = Query(None),
+    order_code: Optional[str] = Query(None),
+    current_user: User = Depends(require_role("head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+    order = get_or_sync_official_order(db, order_code=order_code, order_id=order_id)
+    pdf_path, doc_hash = ensure_order_pdf(order, db)
+
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"Prikaz_Kafedry_VTiPO_{order.verification_code}.pdf",
+        headers={
+            "X-Document-Hash": doc_hash,
+            "X-Verification-Code": order.verification_code
+        }
+    )
+
+@app.get("/verify/{verification_code}")
+def verify_document_page(verification_code: str, db: Session = Depends(get_db, scope="function")):
+    """Публичная верификация подлинности официального приказа по QR-коду"""
+    order = db.query(OfficialOrder).filter(OfficialOrder.verification_code == verification_code).first()
+    is_valid = order is not None and order.status in ("SIGNED", "ACTIVE")
+
+    order_num = order.order_number if order else "—"
+    order_year = order.academic_year if order else "2026–2027 гг."
+    order_date = order.created_at.strftime("%d.%m.%Y") if (order and order.created_at) else "—"
+
+    if is_valid:
+        try:
+            _, real_hash = ensure_order_pdf(order, db)
+        except HTTPException:
+            real_hash = "Несоответствие файла и реестра"
+            is_valid = False
+        items_count = len(order.items)
+    else:
+        real_hash = "—"
+        items_count = 0
+    verification_code = escape(verification_code)
+    order_num, order_year = escape(order_num), escape(order_year)
+
+    status_badge = """
+    <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 text-xs font-extrabold uppercase tracking-wider mb-4 border border-emerald-200">
+        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+        Документ зарегистрирован в реестре META
+    </div>
+    """ if is_valid else """
+    <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-50 text-rose-700 text-xs font-extrabold uppercase tracking-wider mb-4 border border-rose-200">
+        <span class="w-2 h-2 rounded-full bg-rose-500"></span>
+        Документ не найден в реестре META
+    </div>
+    """
+
+    status_title = "Официальный приказ кафедры ВТиПО" if is_valid else "Документ не найден"
+    registration_status = "Зарегистрирован в реестре META" if is_valid else "Не найден в реестре"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Верификация документа • Цифровой реестр META</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    </head>
+    <body class="bg-slate-50 font-['Inter'] min-h-screen flex items-center justify-center p-4">
+        <div class="bg-white max-w-lg w-full rounded-3xl shadow-xl border border-slate-200/80 p-8 text-center relative overflow-hidden">
+            <div class="absolute -top-12 -right-12 w-40 h-40 {'bg-emerald-100/60' if is_valid else 'bg-rose-100/60'} rounded-full blur-2xl"></div>
+            
+            <div class="w-16 h-16 {'bg-emerald-100 text-emerald-600' if is_valid else 'bg-rose-100 text-rose-600'} rounded-2xl flex items-center justify-center mx-auto mb-5 shadow-sm">
+                <svg class="w-9 h-9" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="{'M5 13l4 4L19 7' if is_valid else 'M6 18L18 6M6 6l12 12'}"></path>
+                </svg>
+            </div>
+
+            {status_badge}
+
+            <h1 class="text-2xl font-extrabold text-slate-900 mb-2">{status_title}</h1>
+            <p class="text-xs text-slate-500 font-medium mb-6">Идентификатор верификации: <code class="bg-slate-100 px-2 py-0.5 rounded font-bold text-slate-800">{verification_code}</code></p>
+
+            <div class="bg-slate-50 rounded-2xl p-5 text-left text-xs space-y-3 border border-slate-100 mb-6 font-medium">
+                <div class="flex justify-between">
+                    <span class="text-slate-400">Статус регистрации:</span>
+                    <span class="font-bold {'text-emerald-700' if is_valid else 'text-rose-600'}">{registration_status}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-slate-400">Номер приказа:</span>
+                    <span class="font-bold text-slate-800">{order_num}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-slate-400">Дата приказа:</span>
+                    <span class="font-bold text-slate-800">{order_date}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-slate-400">Учебный год:</span>
+                    <span class="font-bold text-slate-800">{order_year}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-slate-400">Утверждено тем:</span>
+                    <span class="font-bold text-emerald-700">{items_count} дипломных проектов</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-slate-400">Кем утверждено:</span>
+                    <span class="font-bold text-slate-800">Заведующий кафедрой ВТиПО Проф. Касымов А.Б.</span>
+                </div>
+                <div class="space-y-1 pt-1 border-t border-slate-200/60">
+                    <div class="text-slate-400 font-medium">Контрольная сумма SHA-256:</div>
+                    <div class="font-mono text-[11px] text-slate-800 bg-white p-2.5 rounded-xl break-all select-all font-semibold border border-slate-200/90 shadow-inner" id="document-hash">{real_hash}</div>
+                </div>
+            </div>
+
+            <a href="/" class="inline-flex items-center justify-center w-full py-3.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs shadow-md transition">
+                &larr; Вернуться на платформу META
+            </a>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+@app.get("/api/export/order")
+@app.get("/api/export-order")
+def export_order_csv(
+    current_user: User = Depends(require_role("head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+    apps = db.query(Application).filter(Application.status.in_(["APPROVED", "CONFIRMED_BY_HEAD"])).all()
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["№ п/п", "ФИО Студента", "GPA / Рейтинг", "Тема дипломного проекта", "Научный руководитель", "Кафедра / Направление", "Статус утверждения", "Дата"])
+
+    for idx, a in enumerate(apps, start=1):
+        status_label = "Утверждено приказом" if a.status == "CONFIRMED_BY_HEAD" else "Одобрено кафедрой"
+        writer.writerow([
+            idx,
+            a.student.full_name if a.student else "",
+            a.student.gpa if a.student else 3.5,
+            (a.topic.title_ru or a.topic.title) if a.topic else a.custom_title,
+            a.topic.supervisor_name if a.topic else "—",
+            a.topic.department if a.topic else "ВТиПО",
+            status_label,
+            a.created_at.strftime("%d.%m.%Y") if a.created_at else ""
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=Prikaz_Kafedry_VTiPO_2026.csv"}
+    )
+
+@app.get("/api/export/statement/{application_id}")
+def export_statement_html(
+    application_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function")
+):
+    app_inst = db.query(Application).filter(Application.id == application_id).first()
+    if not app_inst:
+        raise HTTPException(status_code=404, detail="Заявка не найдена")
+
+    if current_user.role == "student" and app_inst.student_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Студент может просматривать только свои заявления")
+    if current_user.role == "teacher":
+        supervisor_id = app_inst.topic.supervisor_id if app_inst.topic else (app_inst.custom_topic.supervisor_id if app_inst.custom_topic else None)
+        if supervisor_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Преподаватель может просматривать заявления только по своим темам")
+    elif current_user.role not in ("student", "head", "admin"):
+        raise HTTPException(status_code=403, detail="Недостаточно прав")
+
+    topic_title = (app_inst.topic.title_ru or app_inst.topic.title) if app_inst.topic else app_inst.custom_title
+    supervisor = app_inst.topic.supervisor_name if app_inst.topic else 'назначенного преподавателя'
+
+    topic_title = escape(topic_title or "")
+    supervisor = escape(supervisor or "")
+    student_name = escape(app_inst.student.full_name if app_inst.student else "Студент")
+    motivation = escape(app_inst.motivation or "")
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <title>Заявление на утверждение темы дипломной работы</title>
+        <style>
+            body {{ font-family: 'Times New Roman', serif; font-size: 14pt; line-height: 1.5; margin: 40px 60px; color: #000; }}
+            .right {{ text-align: right; margin-left: 50%; margin-bottom: 40px; }}
+            .center {{ text-align: center; font-weight: bold; margin-bottom: 25px; font-size: 16pt; }}
+            .content {{ text-align: justify; margin-bottom: 40px; text-indent: 35px; }}
+            .signatures {{ display: flex; justify-content: space-between; margin-top: 60px; }}
+            @media print {{ body {{ margin: 20mm; }} }}
+        </style>
+    </head>
+    <body>
+        <div class="right">
+            Заведующему кафедрой ВТиПО<br>
+            д.т.н., профессору Касымову А.Б.<br>
+            студента(ки) специальности ВТиПО<br>
+            <b>{student_name}</b><br>
+            тел.: +7 (777) 000-00-00
+        </div>
+        <div class="center">
+            ЗАЯВЛЕНИЕ
+        </div>
+        <div class="content">
+            Прошу утвердить мне тему дипломной работы: <b>«{topic_title}»</b>
+            и назначить научным руководителем <b>{supervisor}</b>.
+        </div>
+        <div class="content">
+            Обоснование выбора и мотивация: <i>{motivation}</i>
+        </div>
+        <div class="signatures">
+            <div>
+                «_____» ____________ 2026 г.<br><br>
+                Подпись студента: ________________
+            </div>
+            <div>
+                Согласовано научным руководителем:<br><br>
+                Подпись: ________________ ({supervisor})
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+# ─── Norm-Control ГОСТ (.DOCX) ────────────────────────────────────────────────
+def resolve_run_font_name(run, paragraph, doc) -> Optional[str]:
+    """Разрешение гарнитуры шрифта из run -> run.style -> paragraph.style -> Normal style."""
+    if run.font and run.font.name:
+        return run.font.name
+    if run.style and run.style.font and run.style.font.name:
+        return run.style.font.name
+    st = paragraph.style
+    while st:
+        if st.font and st.font.name:
+            return st.font.name
+        st = getattr(st, "base_style", None)
+    try:
+        normal = doc.styles["Normal"]
+        if normal and normal.font and normal.font.name:
+            return normal.font.name
+    except Exception:
+        pass
+    return None
+
+def resolve_run_font_size(run, paragraph, doc) -> Optional[float]:
+    """Разрешение кегля шрифта (pt) из run -> run.style -> paragraph.style -> Normal style."""
+    if run.font and run.font.size is not None:
+        try:
+            return float(run.font.size.pt)
+        except Exception:
+            pass
+    if run.style and run.style.font and run.style.font.size is not None:
+        try:
+            return float(run.style.font.size.pt)
+        except Exception:
+            pass
+    st = paragraph.style
+    while st:
+        if st.font and st.font.size is not None:
+            try:
+                return float(st.font.size.pt)
+            except Exception:
+                pass
+        st = getattr(st, "base_style", None)
+    try:
+        normal = doc.styles["Normal"]
+        if normal and normal.font and normal.font.size is not None:
+            return float(normal.font.size.pt)
+    except Exception:
+        pass
+    return None
+
+def resolve_paragraph_line_spacing(paragraph, doc) -> Optional[float]:
+    """Разрешение межстрочного интервала (множитель или pt) из абзаца -> стиля -> Normal."""
+    pf = paragraph.paragraph_format
+    if pf and pf.line_spacing is not None:
+        if isinstance(pf.line_spacing, (int, float)):
+            return float(pf.line_spacing)
+        try:
+            return float(pf.line_spacing.pt)
+        except Exception:
+            pass
+    st = paragraph.style
+    while st:
+        if hasattr(st, "paragraph_format") and st.paragraph_format and st.paragraph_format.line_spacing is not None:
+            ls = st.paragraph_format.line_spacing
+            if isinstance(ls, (int, float)):
+                return float(ls)
+            try:
+                return float(ls.pt)
+            except Exception:
+                pass
+        st = getattr(st, "base_style", None)
+    try:
+        normal = doc.styles["Normal"]
+        if normal and normal.paragraph_format and normal.paragraph_format.line_spacing is not None:
+            ls = normal.paragraph_format.line_spacing
+            if isinstance(ls, (int, float)):
+                return float(ls)
+            try:
+                return float(ls.pt)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+@app.post("/api/norm-control/check-docx")
+async def check_docx_norm_control(file: UploadFile = File(...)):
+    filename = file.filename or ""
+    if not filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Формат файла должен быть строго .docx")
+
+    MAX_NORM_DOCX_SIZE = 15 * 1024 * 1024  # 15 MB
+    content = await file.read(MAX_NORM_DOCX_SIZE + 1)
+    if len(content) > MAX_NORM_DOCX_SIZE:
+        raise HTTPException(status_code=413, detail="Размер документа превышает допустимый лимит (15 МБ)")
+    if not content or len(content) < 50:
+        raise HTTPException(status_code=400, detail="Файл пуст или поврежден")
+
+    validate_docx_archive(content)
+    try:
+        doc = docx.Document(BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Не удалось открыть документ DOCX")
+
+    checks = []
+    score_points = 0
+
+    # 1. Margins
+    sections = doc.sections
+    if sections:
+        sec = sections[0]
+        left_mm = round(sec.left_margin.mm, 1) if sec.left_margin else 30.0
+        right_mm = round(sec.right_margin.mm, 1) if sec.right_margin else 10.0
+        top_mm = round(sec.top_margin.mm, 1) if sec.top_margin else 20.0
+        bottom_mm = round(sec.bottom_margin.mm, 1) if sec.bottom_margin else 20.0
+
+        if 27.0 <= left_mm <= 33.0:
+            score_points += 15
+            checks.append({"category": "Поля страницы", "passed": True, "title": f"Левое поле: {left_mm} мм", "detail": "Соответствует стандарту ГОСТ (30 мм)."})
+        else:
+            checks.append({"category": "Поля страницы", "passed": False, "title": f"Левое поле: {left_mm} мм (Требуется: 30 мм)", "detail": "Левое поле должно быть ровно 30 мм для переплета."})
+
+        if 8.0 <= right_mm <= 15.0:
+            score_points += 10
+            checks.append({"category": "Поля страницы", "passed": True, "title": f"Правое поле: {right_mm} мм", "detail": "Соответствует стандарту (10 мм)."})
+        else:
+            checks.append({"category": "Поля страницы", "passed": False, "title": f"Правое поле: {right_mm} мм (Требуется: 10 мм)", "detail": "Правое поле страницы должно составлять 10 мм."})
+
+        if (18.0 <= top_mm <= 22.0) and (18.0 <= bottom_mm <= 22.0):
+            score_points += 15
+            checks.append({"category": "Поля страницы", "passed": True, "title": f"Верхнее ({top_mm} мм) и нижнее ({bottom_mm} мм) поля", "detail": "Соответствуют стандарту ГОСТ (20 мм)."})
+        else:
+            checks.append({"category": "Поля страницы", "passed": False, "title": f"Верх/Низ: {top_mm} мм / {bottom_mm} мм (Требуется: 20 мм)", "detail": "Верхнее и нижнее поля должны быть установлены по 20 мм."})
+    else:
+        checks.append({"category": "Поля страницы", "passed": False, "title": "Секции документа не найдены", "detail": "Не удалось определить параметры разметки страницы."})
+
+    # 2. Font & Size & Line Spacing
+    total_paragraphs = len(doc.paragraphs)
+    all_text = " ".join(p.text for p in doc.paragraphs if p.text.strip())
+    word_count = len(all_text.split()) if all_text else 0
+    estimated_pages = max(1, round(word_count / 280)) if word_count else max(1, round(total_paragraphs / 18))
+
+    tnr_count = 0
+    unknown_font_count = 0
+    pt14_count = 0
+    unknown_size_count = 0
+    line_spacing_ok = 0
+    unknown_ls_count = 0
+    sampled_runs = 0
+    non_empty_paragraphs = 0
+
+    for p in doc.paragraphs:
+        if not p.text.strip():
+            continue
+        non_empty_paragraphs += 1
+
+        ls = resolve_paragraph_line_spacing(p, doc)
+        if ls is None:
+            unknown_ls_count += 1
+        elif (isinstance(ls, (int, float)) and 1.35 <= ls <= 1.65) or (19.0 <= ls <= 23.0):
+            line_spacing_ok += 1
+
+        for run in p.runs:
+            if run.text.strip():
+                sampled_runs += 1
+                fname = resolve_run_font_name(run, p, doc)
+                if fname is None:
+                    unknown_font_count += 1
+                elif "times" in fname.lower() or "tnr" in fname.lower():
+                    tnr_count += 1
+
+                fsize = resolve_run_font_size(run, p, doc)
+                if fsize is None:
+                    unknown_size_count += 1
+                elif 13.5 <= fsize <= 14.5:
+                    pt14_count += 1
+
+    # Font Evaluation (None/UNKNOWN is NOT auto-pass)
+    if sampled_runs == 0:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "WARNING",
+            "title": "Текст для анализа шрифта не найден",
+            "detail": "Документ не содержит текста для проверки гарнитуры."
+        })
+    elif unknown_font_count == sampled_runs:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "UNKNOWN",
+            "title": "Гарнитура шрифта не определена (UNKNOWN/WARNING)",
+            "detail": "В документе не задан явный шрифт (наследуются неустановленные свойства). По ГОСТ требуется Times New Roman."
+        })
+    elif (tnr_count / sampled_runs) >= 0.8:
+        score_points += 15
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": True,
+            "status": "PASS",
+            "title": "Гарнитура шрифта: Times New Roman",
+            "detail": "Основной массив текста выполнен стандартным академическим шрифтом."
+        })
+    else:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "WARNING" if unknown_font_count > 0 else "FAIL",
+            "title": f"Нестандартный шрифт ({round((1 - tnr_count / sampled_runs) * 100)}% текста или UNKNOWN)",
+            "detail": "По ГОСТу весь основной текст диплома должен быть оформлен шрифтом Times New Roman."
+        })
+
+    # Size Evaluation (None/UNKNOWN is NOT auto-pass)
+    if sampled_runs == 0:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "WARNING",
+            "title": "Кегль шрифта не определен",
+            "detail": "Документ не содержит текста для проверки кегля."
+        })
+    elif unknown_size_count == sampled_runs:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "UNKNOWN",
+            "title": "Размер шрифта не определен (UNKNOWN/WARNING)",
+            "detail": "В документе не задан явный размер шрифта (наследуются неустановленные свойства). По ГОСТ требуется 14 пт."
+        })
+    elif (pt14_count / sampled_runs) >= 0.75:
+        score_points += 15
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": True,
+            "status": "PASS",
+            "title": "Размер шрифта: 14 пт",
+            "detail": "Кегль 14 pt соблюден в основном тексте."
+        })
+    else:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "WARNING" if unknown_size_count > 0 else "FAIL",
+            "title": "Размер шрифта отличается от 14 пт (или не задан явно)",
+            "detail": "Приведите основной текст к кеглю 14 пт."
+        })
+
+    # Line Spacing Evaluation (None/UNKNOWN is NOT auto-pass)
+    if non_empty_paragraphs == 0:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "WARNING",
+            "title": "Абзацы для проверки интервала не найдены",
+            "detail": "Документ не содержит абзацев с текстом."
+        })
+    elif unknown_ls_count == non_empty_paragraphs:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "UNKNOWN",
+            "title": "Междустрочный интервал не определен (UNKNOWN/WARNING)",
+            "detail": "Интервал не задан явно ни в абзацах, ни в стилях. По ГОСТ требуется 1.5 строки."
+        })
+    elif (line_spacing_ok / non_empty_paragraphs) >= 0.5:
+        score_points += 10
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": True,
+            "status": "PASS",
+            "title": "Междустрочный интервал: 1.5 строки",
+            "detail": "Интервал соответствует требованиям нормативного оформления."
+        })
+    else:
+        checks.append({
+            "category": "Шрифт и типографика",
+            "passed": False,
+            "status": "WARNING" if unknown_ls_count > 0 else "FAIL",
+            "title": "Междустрочный интервал не 1.5",
+            "detail": "Установите в настройках абзаца полуторный интервал (1.5 строки)."
+        })
+
+    # 3. Structure
+    full_text_lower = all_text.lower()
+    has_intro = any(k in full_text_lower for k in ["введение", "кіріспе", "introduction"])
+    has_conclusion = any(k in full_text_lower for k in ["заключение", "қорытынды", "conclusion"])
+    has_bibliography = any(k in full_text_lower for k in [
+        "список литературы", "список использованных источников",
+        "пайдаланылған әдебиеттер", "references", "библиография"
+    ])
+
+    if has_intro:
+        score_points += 7
+        checks.append({"category": "Структура работы", "passed": True, "title": "Раздел «Введение» присутствует", "detail": "Обязательный структурный элемент обнаружен."})
+    else:
+        checks.append({"category": "Структура работы", "passed": False, "title": "Отсутствует раздел «Введение» / «Кіріспе»", "detail": "В структуре дипломной работы обязательно должно быть Введение."})
+
+    if has_conclusion:
+        score_points += 7
+        checks.append({"category": "Структура работы", "passed": True, "title": "Раздел «Заключение» присутствует", "detail": "Итоговый раздел с выводами обнаружен."})
+    else:
+        checks.append({"category": "Структура работы", "passed": False, "title": "Отсутствует раздел «Заключение» / «Қорытынды»", "detail": "Необходимо добавить раздел «Заключение»."})
+
+    if has_bibliography:
+        score_points += 6
+        checks.append({"category": "Структура работы", "passed": True, "title": "«Список литературы» присутствует", "detail": "Библиографический раздел обнаружен."})
+    else:
+        checks.append({"category": "Структура работы", "passed": False, "title": "Отсутствует «Список использованных источников»", "detail": "Добавьте список литературы согласно стандарту."})
+
+    compliance_percentage = min(100, max(15, score_points))
+    recommendations = [f"{c['category']}: {c['title']} — {c['detail']}" for c in checks if not c["passed"]]
+
+    return {
+        "filename": filename,
+        "score": compliance_percentage,
+        "compliance_percentage": compliance_percentage,
+        "status": "EXCELLENT" if compliance_percentage >= 85 else ("GOOD" if compliance_percentage >= 65 else "NEEDS_FIX"),
+        "statistics": {
+            "paragraphs_count": total_paragraphs,
+            "word_count": word_count,
+            "estimated_pages": estimated_pages
+        },
+        "checks": checks,
+        "recommendations": recommendations
+    }
+
+def safe_unlink(path: str):
+    for _ in range(10):
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+        except OSError:
+            return
+
+# ─── Administration: Backup, Restore & Audit Logs ─────────────────────────────
+@app.get("/api/admin/backup")
+def download_backup(current_user: User = Depends(require_role("head", "admin")), db: Session = Depends(get_db, scope="function")):
+    db_path = get_active_sqlite_db_path()
+    if not os.path.exists(db_path):
+        raise HTTPException(status_code=404, detail="Активная база данных не найдена")
+    filename = f"diploma_backup_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.db"
+    log_audit(db, current_user.id, "BACKUP_CREATED", "Создан согласованный снимок SQLite")
+    db.commit()
+    descriptor, snapshot = tempfile.mkstemp(suffix=".db")
+    os.close(descriptor)
+    try:
+        with sqlite3.connect(db_path) as source, sqlite3.connect(snapshot) as destination:
+            source.backup(destination)
+    except Exception:
+        safe_unlink(snapshot)
+        raise
+    return FileResponse(snapshot, filename=filename, media_type="application/octet-stream",
+                        background=BackgroundTask(safe_unlink, snapshot))
+
+
+@app.post("/api/admin/restore")
+async def restore_database(file: UploadFile = File(...), request: Request = None,
+    current_user: User = Depends(require_role("head", "admin")), db: Session = Depends(get_db, scope="function")):
+    filename = file.filename or ""
+    if not filename.lower().endswith(".db"):
+        raise HTTPException(status_code=400, detail="Разрешены только файлы резервных копий с расширением .db")
+    content = await file.read(50 * 1024 * 1024 + 1)
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Размер резервной копии превышает допустимый лимит")
+    if not content.startswith(b"SQLite format 3\x00"):
+        raise HTTPException(status_code=400, detail="Поврежденная резервная копия SQLite")
+    actor_id, actor_email = current_user.id, current_user.email
+    descriptor, candidate_path = tempfile.mkstemp(suffix=".db")
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+        candidate = sqlite3.connect(candidate_path)
+        try:
+            if candidate.execute("PRAGMA integrity_check").fetchall() != [("ok",)] or candidate.execute("PRAGMA foreign_key_check").fetchall():
+                raise HTTPException(status_code=400, detail="Нарушена целостность резервной копии")
+            for table in Base.metadata.sorted_tables:
+                columns = {row[1] for row in candidate.execute('PRAGMA table_info("' + table.name + '")')}
+                if not {column.name for column in table.columns}.issubset(columns):
+                    raise HTTPException(status_code=400, detail="Схема резервной копии несовместима")
+            for query in (
+                "SELECT student_id FROM applications WHERE status IN ('APPROVED','SUPERVISOR_APPROVED','CONFIRMED_BY_HEAD','ALLOCATED') GROUP BY student_id HAVING COUNT(*)>1",
+                "SELECT student_id,topic_id FROM applications WHERE topic_id IS NOT NULL GROUP BY student_id,topic_id HAVING COUNT(*)>1",
+                "SELECT student_id,priority FROM applications WHERE status!='REJECTED' GROUP BY student_id,priority HAVING COUNT(*)>1",
+                "SELECT id FROM topics WHERE quota_total<=0 OR quota_used<0 OR quota_used>quota_total",
+            ):
+                if candidate.execute(query).fetchone():
+                    raise HTTPException(status_code=400, detail="Резервная копия содержит противоречивые назначения или квоты")
+            for table in Base.metadata.sorted_tables:
+                actual_fks = {(row[3], row[2], row[4]) for row in candidate.execute('PRAGMA foreign_key_list("' + table.name + '")')}
+                expected_fks = {(fk.parent.name, fk.column.table.name, fk.column.name) for fk in table.foreign_keys}
+                if not expected_fks.issubset(actual_fks):
+                    raise HTTPException(status_code=400, detail="Резервная копия не содержит обязательных внешних ключей")
+            for statement in (
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_application_assigned_student ON applications(student_id) WHERE status IN ('APPROVED','SUPERVISOR_APPROVED','CONFIRMED_BY_HEAD','ALLOCATED')",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_application_active_priority ON applications(student_id,priority) WHERE status!='REJECTED'",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_student_topic ON applications(student_id,topic_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_application_custom_topic ON applications(student_id,custom_topic_id) WHERE custom_topic_id IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_checkpoint_version ON checkpoint_submissions(checkpoint_id,version)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_checkpoint_student_stage ON checkpoints(student_id,stage)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_order_student ON order_items(order_id,student_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_preferences_student_priority ON preferences(student_id,priority)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_preferences_student_topic ON preferences(student_id,topic_id)",
+            ):
+                candidate.execute(statement)
+            # Old bearer tokens must not become valid again after a restore.
+            candidate.execute("DELETE FROM sessions")
+            candidate.commit()
+            # Preserve the live file and use SQLite's atomic backup protocol.
+            # Replacing a live .db file with open pooled connections is unsafe.
+            db.rollback()
+            db.close()
+            live = sqlite3.connect(get_active_sqlite_db_path())
+            try:
+                candidate.backup(live)
+            finally:
+                live.close()
+        finally:
+            candidate.close()
+        engine.dispose()
+        with SessionLocal() as audit_db:
+            log_audit(audit_db, actor_id, "DB_RESTORE", "Восстановлен проверенный снимок SQLite", user_email=actor_email)
+            audit_db.commit()
+    except sqlite3.DatabaseError as exc:
+        raise HTTPException(status_code=400, detail="Поврежденная резервная копия SQLite") from exc
+    finally:
+        safe_unlink(candidate_path)
+    return {"message": "База данных успешно восстановлена", "filename": filename}
+
+@app.get("/api/admin/audit-logs")
+def get_audit_logs(
+    current_user: User = Depends(require_role("head", "admin")),
+    db: Session = Depends(get_db, scope="function")
+):
+    logs = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(100).all()
+    return [{
+        "id": l.id,
+        "user_id": l.user_id,
+        "user_email": l.user_email or "система",
+        "action": l.action,
+        "details": l.details,
+        "ip_address": l.ip_address or "127.0.0.1",
+        "timestamp": l.created_at.strftime("%d.%m.%Y %H:%M:%S") if l.created_at else ""
+    } for l in logs]
+
+@app.post("/api/company/topics")
+def publish_company_topic(req: CompanyTopicSchema, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(require_role("company"))):
+    if req.company_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Нельзя публиковать тему от чужой компании")
+    comp = db.query(User).filter(User.id == req.company_id, User.role == "company").first()
+    if not comp:
+        raise HTTPException(status_code=403, detail="Только аккаунт компании может публиковать темы")
+
+    topic = Topic(
+        title=req.title,
+        title_ru=req.title,
+        title_kz=f"{req.title} (қаз)",
+        title_en=f"{req.title} (en)",
+        supervisor_id=current_user.id,
+        supervisor_name=f"{comp.full_name} ({req.supervisor_name})",
+        department=req.department,
+        category="INDUSTRIAL",
+        tags=req.tags,
+        required_skills=req.required_skills,
+        difficulty=req.difficulty,
+        has_data=req.has_data,
+        quota_total=req.quota_total,
+        quota_used=0,
+        status="available",
+        academic_year="2026-2027",
+        work_type="DIPLOMA",
+        source="company"
+    )
+    db.add(topic)
+    db.commit()
+    db.refresh(topic)
+    log_audit(db, req.company_id, "COMPANY_TOPIC_CREATED", f"Опубликован индустриальный кейс «{topic.title}»")
+    return {"message": "Тема компании успешно размещена на бирже", "topic_id": topic.id}
+
+@app.get("/api/company/bids")
+def get_company_bids(company_id: int, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(require_role("company"))):
+    if company_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Нельзя смотреть заявки другой компании")
+    comp = db.query(User).filter(User.id == company_id).first()
+    if not comp:
+        return []
+    topics = db.query(Topic).filter(Topic.supervisor_id == current_user.id).all()
+    t_ids = [t.id for t in topics]
+    apps = db.query(Application).filter(Application.topic_id.in_(t_ids)).all()
+    return [{
+        "app_id": a.id,
+        "topic_title": a.topic.title_ru or a.topic.title if a.topic else "",
+        "student_name": a.student.full_name if a.student else "",
+        "student_rating": a.student.gpa if a.student else 3.5,
+        "student_skills": a.student.skills if a.student else "",
+        "motivation": a.motivation,
+        "status": a.status,
+        "created_at": a.created_at.strftime("%d.%m.%Y") if a.created_at else ""
+    } for a in apps]
+
+@app.get("/uploads/{file_name}")
+def serve_uploaded_file(file_name: str, db: Session = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)):
+    if not file_name or ".." in file_name or "/" in file_name or "\\" in file_name:
+        raise HTTPException(status_code=400, detail="Недопустимое имя файла")
+    clean_name = os.path.basename(file_name)
+    base_dir = UPLOADS_DIR
+    cp_dir = os.path.abspath(os.path.join(base_dir, "checkpoints"))
+
+    filepath = os.path.abspath(os.path.join(base_dir, clean_name))
+    if not os.path.exists(filepath):
+        filepath = os.path.abspath(os.path.join(cp_dir, clean_name))
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Файл не найден")
+
+    if os.path.commonpath([filepath, base_dir]) != base_dir:
+        raise HTTPException(status_code=403, detail="Доступ запрещен")
+
+    cp = db.query(Checkpoint).filter(Checkpoint.file_name == clean_name).first()
+    sub = db.query(CheckpointSubmission).filter(CheckpointSubmission.file_path == filepath).first()
+    if not cp and sub:
+        cp = sub.checkpoint
+    if not cp:
+        raise HTTPException(status_code=403, detail="Файл не привязан к доступной контрольной точке")
+    require_checkpoint_access(db, current_user, cp)
+    return FileResponse(safe_upload_path(filepath), filename=clean_name, media_type="application/octet-stream", headers={"X-Content-Type-Options": "nosniff"})
+
+
+# ─── Demo Reset Endpoint ───────────────────────────────────────────────────────
+DUMMY_PDF_PAYLOAD = (
+    b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n"
+    b"3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R/Resources<<>>>>endobj\n"
+    b"xref\n0 4\n0000000000 65535 f\n0000000010 00000 n\n0000000059 00000 n\n0000000115 00000 n\n"
+    b"trailer<</Size 4/Root 1 0 R>>\nstartxref\n197\n%%EOF"
+)
+
+def reset_demo_state(db: Session):
+    """Сбрасывает базу данных в эталонное демонстрационное состояние META."""
+    # 1. Clear operational tables
+    db.query(OrderItem).delete()
+    db.query(CheckpointSubmission).delete()
+    db.query(Checkpoint).delete()
+    db.query(Preference).delete()
+    db.query(Application).delete()
+    db.query(Notification).delete()
+    db.query(CustomTopicProposal).delete()
+    db.commit()
+
+    # 2. Setup standard users
+    pwd_hash = hash_password("123456")
+    users_spec = [
+        {"email": "student@test.com", "full_name": "Алиев Арман Серикович", "role": "student", "gpa": 3.85, "group_name": "ИС-22-1", "student_number": "22B030001", "department": "ВТиПО", "skills": "Python, Vue.js, FastAPI, PostgreSQL"},
+        {"email": "teacher@test.com", "full_name": "Доц. Ахметов К.А.", "role": "teacher", "gpa": 5.0, "group_name": None, "student_number": None, "department": "ВТиПО", "skills": "Web-разработка, Архитектура ПО"},
+        {"email": "head@test.com", "full_name": "Проф. Касымов А.Б.", "role": "head", "gpa": 5.0, "group_name": None, "student_number": None, "department": "ВТиПО", "skills": "Машинное обучение, Информационная безопасность"},
+        {"email": "admin@test.com", "full_name": "Администратор Системы", "role": "admin", "gpa": 5.0, "group_name": None, "student_number": None, "department": "ВТиПО", "skills": "DevOps, Безопасность"},
+        {"email": "company@test.com", "full_name": "ТОО ТехноСервис", "role": "company", "gpa": 4.8, "group_name": None, "student_number": None, "department": "Индустриальные проекты", "skills": "ИТ-консалтинг, Разработка ПО"},
+        {"email": "student2@test.com", "full_name": "Бектурсынов Данияр", "role": "student", "gpa": 3.92, "group_name": "ИС-22-1", "student_number": "22B030002", "department": "ВТиПО", "skills": "PyTorch, OpenCV, Computer Vision"},
+        {"email": "student3@test.com", "full_name": "Серік Аружан", "role": "student", "gpa": 3.45, "group_name": "ИС-22-2", "student_number": "22B030003", "department": "ВТиПО", "skills": "Arduino, C++, ESP32, MQTT"},
+        {"email": "student4@test.com", "full_name": "Омаров Нурлан", "role": "student", "gpa": 3.70, "group_name": "ИС-22-2", "student_number": "22B030004", "department": "ВТиПО", "skills": "Linux, Wireshark, Cryptography"},
+        {"email": "student5@test.com", "full_name": "Жумабекова Динара", "role": "student", "gpa": 3.65, "group_name": "ИС-22-1", "student_number": "22B030005", "department": "ВТиПО", "skills": "Data Analysis, SQL, Python"},
+        {"email": "student6@test.com", "full_name": "Калиев Тимур", "role": "student", "gpa": 3.88, "group_name": "ИС-22-1", "student_number": "22B030006", "department": "ВТиПО", "skills": "Cybersecurity, Reverse Engineering, C"},
+        {"email": "student7@test.com", "full_name": "Смагулова Айгерим", "role": "student", "gpa": 3.52, "group_name": "ИС-22-2", "student_number": "22B030007", "department": "ВТиПО", "skills": "IoT, Cloud, Networking"},
+        {"email": "student8@test.com", "full_name": "Ибраев Руслан", "role": "student", "gpa": 3.30, "group_name": "ИС-22-2", "student_number": "22B030008", "department": "ВТиПО", "skills": "NLP, Prompt Engineering, Python"},
+        {"email": "student9@test.com", "full_name": "Токтарова Мадина", "role": "student", "gpa": 3.78, "group_name": "ИС-22-1", "student_number": "22B030009", "department": "ВТиПО", "skills": "Machine Learning, Scikit-Learn"},
+        {"email": "student10@test.com", "full_name": "Амангельды Ерлан", "role": "student", "gpa": 3.40, "group_name": "ИС-22-2", "student_number": "22B030010", "department": "ВТиПО", "skills": "Fullstack, React, Node.js"},
+        {"email": "student11@test.com", "full_name": "Жандосов Мурат", "role": "student", "gpa": 3.55, "group_name": "ИС-22-1", "student_number": "22B030011", "department": "ВТиПО", "skills": "Frontend, Vue, TypeScript"},
+        {"email": "student12@test.com", "full_name": "Кенесбай Айдос", "role": "student", "gpa": 3.80, "group_name": "ИС-22-1", "student_number": "22B030012", "department": "ВТиПО", "skills": "Python, Django"},
+        {"email": "student13@test.com", "full_name": "Садыкова Зарина", "role": "student", "gpa": 3.75, "group_name": "ИС-22-1", "student_number": "22B030013", "department": "ВТиПО", "skills": "Vue.js, REST API"},
+        {"email": "student14@test.com", "full_name": "Бауыржанулы Азамат", "role": "student", "gpa": 3.60, "group_name": "ИС-22-1", "student_number": "22B030014", "department": "ВТиПО", "skills": "Docker, FastAPI"},
+        {"email": "student15@test.com", "full_name": "Ерланкызы Малика", "role": "student", "gpa": 3.90, "group_name": "ИС-22-2", "student_number": "22B030015", "department": "ВТиПО", "skills": "Computer Vision, OpenCV"},
+        {"email": "student16@test.com", "full_name": "Утепов Бахыт", "role": "student", "gpa": 3.85, "group_name": "ИС-22-2", "student_number": "22B030016", "department": "ВТиПО", "skills": "Deep Learning, PyTorch"},
+        {"email": "student17@test.com", "full_name": "Муратов Асылхан", "role": "student", "gpa": 3.50, "group_name": "ИС-22-2", "student_number": "22B030017", "department": "ВТиПО", "skills": "LoRaWAN, Sensors"},
+        {"email": "student18@test.com", "full_name": "Кайратулы Олжас", "role": "student", "gpa": 3.65, "group_name": "ИС-22-2", "student_number": "22B030018", "department": "ВТиПО", "skills": "C++, Embedded"},
+        {"email": "student19@test.com", "full_name": "Нурланбек Дастан", "role": "student", "gpa": 3.70, "group_name": "ИС-22-1", "student_number": "22B030019", "department": "ВТиПО", "skills": "Network Security"},
+        {"email": "student20@test.com", "full_name": "Асылбекова Анель", "role": "student", "gpa": 3.80, "group_name": "ИС-22-1", "student_number": "22B030020", "department": "ВТиПО", "skills": "Microservices, Go"},
+        {"email": "student21@test.com", "full_name": "Темирланулы Куаныш", "role": "student", "gpa": 3.72, "group_name": "ИС-22-2", "student_number": "22B030021", "department": "Индустриальные проекты", "skills": "LLM, LangChain"}
+    ]
+
+    user_by_email = {}
+    for uspec in users_spec:
+        u = db.query(User).filter(User.email == uspec["email"]).first()
+        if not u:
+            u = User(
+                email=uspec["email"],
+                full_name=uspec["full_name"],
+                password_hash=pwd_hash,
+                role=uspec["role"],
+                gpa=uspec["gpa"],
+                rating=uspec["gpa"],
+                group_name=uspec["group_name"],
+                student_number=uspec["student_number"],
+                department=uspec["department"],
+                skills=uspec["skills"],
+                is_active=True,
+                created_at=datetime.utcnow()
+            )
+            db.add(u)
+            db.flush()
+        else:
+            u.full_name = uspec["full_name"]
+            u.password_hash = pwd_hash
+            u.role = uspec["role"]
+            u.gpa = uspec["gpa"]
+            u.rating = uspec["gpa"]
+            u.group_name = uspec["group_name"]
+            u.student_number = uspec["student_number"]
+            u.department = uspec["department"]
+            u.skills = uspec["skills"]
+            u.is_active = True
+        user_by_email[uspec["email"]] = u
+    db.commit()
+
+    keep_emails = set(user_by_email.keys())
+    db.query(User).filter(~User.email.in_(keep_emails)).update({User.is_active: False}, synchronize_session=False)
+    db.commit()
+
+    teacher = user_by_email["teacher@test.com"]
+    head = user_by_email["head@test.com"]
+
+    # 3. Setup core topics
+    topics_spec = [
+        {
+            "id": 1,
+            "title_ru": "Разработка веб-платформы автоматизации распределения дипломных работ",
+            "title_kz": "Дипломдық жұмыстарды бөлуді автоматтандыруға арналған веб-платформаны әзірлеу",
+            "title_en": "Development of a web platform for automating the distribution of diploma projects",
+            "supervisor_id": teacher.id,
+            "supervisor_name": teacher.full_name,
+            "department": "ВТиПО",
+            "category": "WEB",
+            "tags": "Web, FastAPI, Vue",
+            "required_skills": "Python, Vue.js, SQL",
+            "difficulty": 4,
+            "has_data": True,
+            "quota_total": 5,
+            "quota_used": 4,
+            "status": "available",
+            "academic_year": "2026-2027",
+            "work_type": "DIPLOMA",
+            "source": "teacher"
+        },
+        {
+            "id": 2,
+            "title_ru": "Система детекции дефектов печатных плат на основе Computer Vision",
+            "title_kz": "Computer Vision негізінде баспалық төлемдер ақауларын анықтау жүйесі",
+            "title_en": "Defect detection system for printed circuit boards based on Computer Vision",
+            "supervisor_id": head.id,
+            "supervisor_name": head.full_name,
+            "department": "ВТиПО",
+            "category": "AI_ML",
+            "tags": "AI, Computer Vision, PyTorch",
+            "required_skills": "Python, PyTorch, OpenCV",
+            "difficulty": 5,
+            "has_data": True,
+            "quota_total": 4,
+            "quota_used": 2,
+            "status": "available",
+            "academic_year": "2026-2027",
+            "work_type": "DIPLOMA",
+            "source": "teacher"
+        },
+        {
+            "id": 3,
+            "title_ru": "IoT-система мониторинга микроклимата серверных помещений на базе LoRaWAN",
+            "title_kz": "LoRaWAN негізінде серверлік бөлмелердің микроклиматын бақылауға арналған IoT-жүйесі",
+            "title_en": "IoT server room microclimate monitoring system based on LoRaWAN",
+            "supervisor_id": teacher.id,
+            "supervisor_name": teacher.full_name,
+            "department": "ВТиПО",
+            "category": "IOT",
+            "tags": "IoT, Embedded, Hardware",
+            "required_skills": "C++, ESP32, MQTT",
+            "difficulty": 3,
+            "has_data": True,
+            "quota_total": 3,
+            "quota_used": 2,
+            "status": "available",
+            "academic_year": "2026-2027",
+            "work_type": "DIPLOMA",
+            "source": "teacher"
+        },
+        {
+            "id": 4,
+            "title_ru": "Анализ и обнаружение аномалий сетевого трафика методами машинного обучения",
+            "title_kz": "Машиналық оқыту әдістері арқылы желілік трафик аномалияларын талдау және анықтау",
+            "title_en": "Network traffic anomaly analysis and detection using machine learning",
+            "supervisor_id": head.id,
+            "supervisor_name": head.full_name,
+            "department": "ВТиПО",
+            "category": "CYBERSECURITY",
+            "tags": "Security, ML, Networks",
+            "required_skills": "Linux, Python, Scikit-Learn",
+            "difficulty": 4,
+            "has_data": False,
+            "quota_total": 4,
+            "quota_used": 1,
+            "status": "available",
+            "academic_year": "2026-2027",
+            "work_type": "DIPLOMA",
+            "source": "teacher"
+        },
+        {
+            "id": 5,
+            "title_ru": "Микросервисная платформа учета академической успеваемости студентов",
+            "title_kz": "Студенттердің академиялық үлгерімін есепке алуға арналған микросервистік платформа",
+            "title_en": "Microservice platform for tracking academic student performance",
+            "supervisor_id": teacher.id,
+            "supervisor_name": teacher.full_name,
+            "department": "ВТиПО",
+            "category": "WEB",
+            "tags": "Web, Microservices, Docker",
+            "required_skills": "Docker, Go/Python, REST API",
+            "difficulty": 4,
+            "has_data": True,
+            "quota_total": 2,
+            "quota_used": 2,
+            "status": "full",
+            "academic_year": "2026-2027",
+            "work_type": "DIPLOMA",
+            "source": "teacher"
+        },
+        {
+            "id": 6,
+            "title_ru": "Интеллектуальный ассистент технической поддержки для корпоративного сектора",
+            "title_kz": "Корпоративтік сектор үшін техникалық қолдаудың зияткерлік ассистенті",
+            "title_en": "Intelligent tech support assistant for enterprise sector",
+            "supervisor_id": None,
+            "supervisor_name": "ТОО ТехноСервис",
+            "department": "Индустриальные проекты",
+            "category": "INDUSTRIAL",
+            "tags": "Industry, NLP, LLM",
+            "required_skills": "Python, NLP, Prompt Engineering",
+            "difficulty": 4,
+            "has_data": True,
+            "quota_total": 3,
+            "quota_used": 1,
+            "status": "available",
+            "academic_year": "2026-2027",
+            "work_type": "DIPLOMA",
+            "source": "company"
+        }
+    ]
+
+    for tspec in topics_spec:
+        t = db.query(Topic).filter(Topic.id == tspec["id"]).first()
+        if not t:
+            t = Topic(**tspec)
+            db.add(t)
+            db.flush()
+        else:
+            for k, v in tspec.items():
+                setattr(t, k, v)
+    db.commit()
+
+    db.query(Topic).filter(~Topic.id.in_([1, 2, 3, 4, 5, 6])).delete(synchronize_session=False)
+    db.commit()
+
+    # 4. Applications
+    confirmed_assignments = [
+        (12, 1), (13, 1), (14, 1),
+        (15, 2), (16, 2),
+        (17, 3), (18, 3),
+        (19, 4),
+        (20, 5),
+        (21, 6),
+    ]
+    for s_idx, t_id in confirmed_assignments:
+        u_email = f"student{s_idx}@test.com"
+        u_obj = user_by_email[u_email]
+        app = Application(
+            student_id=u_obj.id,
+            topic_id=t_id,
+            priority=1,
+            status="CONFIRMED_BY_HEAD",
+            motivation="Академическое распределение кафедры ВТиПО",
+            created_at=datetime(2026, 10, 10, 12, 0, 0),
+            updated_at=datetime(2026, 10, 11, 10, 0, 0)
+        )
+        db.add(app)
+    db.flush()
+
+    st1 = user_by_email["student@test.com"]
+    app_st1 = Application(
+        student_id=st1.id,
+        topic_id=1,
+        priority=1,
+        status="APPROVED",
+        motivation="Имею подтвержденный опыт в FastAPI и Vue.js, хочу развивать проект кафедры.",
+        created_at=datetime(2026, 10, 11, 14, 0, 0),
+        updated_at=datetime(2026, 10, 12, 16, 30, 0)
+    )
+    db.add(app_st1)
+
+    st4 = user_by_email["student4@test.com"]
+    app_st4 = Application(
+        student_id=st4.id,
+        topic_id=5,
+        priority=1,
+        status="APPROVED",
+        motivation="Изучаю микросервисы и Docker, хочу реализовать проект на Go.",
+        created_at=datetime(2026, 10, 11, 15, 0, 0),
+        updated_at=datetime(2026, 10, 12, 17, 0, 0)
+    )
+    db.add(app_st4)
+
+    st3 = user_by_email["student3@test.com"]
+    app_st3 = Application(
+        student_id=st3.id,
+        topic_id=3,
+        priority=1,
+        status="SUBMITTED",
+        motivation="Интересуюсь микроконтроллерами STM32, ESP32 и протоколами LoRaWAN.",
+        created_at=datetime(2026, 10, 14, 10, 20, 0)
+    )
+    db.add(app_st3)
+
+    st7 = user_by_email["student7@test.com"]
+    app_st7 = Application(
+        student_id=st7.id,
+        topic_id=3,
+        priority=2,
+        status="SUBMITTED",
+        motivation="Изучала курс сенсорных сетей, планирую разрабатывать серверный модуль сбора телеметрии.",
+        created_at=datetime(2026, 10, 14, 11, 45, 0)
+    )
+    db.add(app_st7)
+
+    # Gale-Shapley Candidates (Students 2, 5, 6, 8, 9, 10, 11)
+    st2 = user_by_email["student2@test.com"]
+    db.add(Preference(student_id=st2.id, topic_id=2, priority=1, rank=1))
+    db.add(Preference(student_id=st2.id, topic_id=4, priority=2, rank=2))
+    db.add(Preference(student_id=st2.id, topic_id=1, priority=3, rank=3))
+    db.add(Application(student_id=st2.id, topic_id=2, priority=1, status="SUBMITTED", motivation="Компьютерное зрение — моя специализация."))
+    db.add(Application(student_id=st2.id, topic_id=4, priority=2, status="SUBMITTED", motivation="Запасной выбор."))
+
+    st5 = user_by_email["student5@test.com"]
+    db.add(Preference(student_id=st5.id, topic_id=2, priority=1, rank=1))
+    db.add(Preference(student_id=st5.id, topic_id=6, priority=2, rank=2))
+    db.add(Preference(student_id=st5.id, topic_id=4, priority=3, rank=3))
+    db.add(Application(student_id=st5.id, topic_id=2, priority=1, status="SUBMITTED", motivation="Дефекты печатных плат."))
+    db.add(Application(student_id=st5.id, topic_id=6, priority=2, status="SUBMITTED", motivation="Корпоративный ассистент."))
+
+    st6 = user_by_email["student6@test.com"]
+    db.add(Preference(student_id=st6.id, topic_id=4, priority=1, rank=1))
+    db.add(Preference(student_id=st6.id, topic_id=2, priority=2, rank=2))
+    db.add(Preference(student_id=st6.id, topic_id=6, priority=3, rank=3))
+    db.add(Application(student_id=st6.id, topic_id=4, priority=1, status="SUBMITTED", motivation="Кибербезопасность и аномалии трафика."))
+    db.add(Application(student_id=st6.id, topic_id=2, priority=2, status="SUBMITTED", motivation="Второй приоритет."))
+
+    st8 = user_by_email["student8@test.com"]
+    db.add(Preference(student_id=st8.id, topic_id=6, priority=1, rank=1))
+    db.add(Preference(student_id=st8.id, topic_id=4, priority=2, rank=2))
+    db.add(Preference(student_id=st8.id, topic_id=2, priority=3, rank=3))
+    db.add(Application(student_id=st8.id, topic_id=6, priority=1, status="SUBMITTED", motivation="NLP и генеративные модели."))
+
+    st9 = user_by_email["student9@test.com"]
+    db.add(Preference(student_id=st9.id, topic_id=2, priority=1, rank=1))
+    db.add(Preference(student_id=st9.id, topic_id=4, priority=2, rank=2))
+    db.add(Preference(student_id=st9.id, topic_id=6, priority=3, rank=3))
+    db.add(Application(student_id=st9.id, topic_id=2, priority=1, status="SUBMITTED", motivation="Промышленный компьютерный зрение."))
+
+    st10 = user_by_email["student10@test.com"]
+    db.add(Preference(student_id=st10.id, topic_id=6, priority=1, rank=1))
+    db.add(Preference(student_id=st10.id, topic_id=4, priority=2, rank=2))
+    db.add(Application(student_id=st10.id, topic_id=6, priority=1, status="SUBMITTED", motivation="Интеллектуальные веб-сервисы."))
+
+    st11 = user_by_email["student11@test.com"]
+    db.add(Preference(student_id=st11.id, topic_id=4, priority=1, rank=1))
+    db.add(Preference(student_id=st11.id, topic_id=6, priority=2, rank=2))
+    db.add(Application(student_id=st11.id, topic_id=4, priority=1, status="SUBMITTED", motivation="Сетевые модели машинного обучения."))
+
+    db.flush()
+
+    # 5. Checkpoints & Files
+    cp_dir = os.path.join(UPLOADS_DIR, "checkpoints")
+    os.makedirs(cp_dir, exist_ok=True)
+
+    for u in user_by_email.values():
+        if u.role == "student":
+            ensure_student_checkpoints(db, u.id)
+
+    st1_cps = db.query(Checkpoint).filter(Checkpoint.student_id == st1.id).order_by(Checkpoint.stage.asc()).all()
+    cp25_file = f"cp_{st1_cps[0].id}_v1_aliev_stage25.pdf"
+    cp50_file = f"cp_{st1_cps[1].id}_v1_aliev_stage50.pdf"
+
+    with open(os.path.join(cp_dir, cp25_file), "wb") as f:
+        f.write(DUMMY_PDF_PAYLOAD)
+    with open(os.path.join(cp_dir, cp50_file), "wb") as f:
+        f.write(DUMMY_PDF_PAYLOAD)
+
+    st1_cps[0].status = "ACCEPTED"
+    st1_cps[0].file_name = cp25_file
+    st1_cps[0].review_comment = "Введение и архитектурный обзор приняты в полном объеме. Замечаний нет."
+    st1_cps[0].updated_at = datetime(2026, 10, 13, 11, 20, 0)
+    sub1 = CheckpointSubmission(
+        checkpoint_id=st1_cps[0].id,
+        student_id=st1.id,
+        file_name="Otchet_25_Aliev.pdf",
+        file_path=os.path.abspath(os.path.join(cp_dir, cp25_file)),
+        version=1,
+        submitted_at=datetime(2026, 10, 12, 18, 0, 0),
+        status="ACCEPTED",
+        review_comment="Введение и архитектурный обзор приняты в полном объеме. Замечаний нет.",
+        reviewed_by=teacher.id,
+        reviewed_at=datetime(2026, 10, 13, 11, 20, 0)
+    )
+    db.add(sub1)
+
+    st1_cps[1].status = "UNDER_REVIEW"
+    st1_cps[1].file_name = cp50_file
+    st1_cps[1].review_comment = None
+    st1_cps[1].updated_at = datetime(2026, 10, 14, 15, 10, 0)
+    sub2 = CheckpointSubmission(
+        checkpoint_id=st1_cps[1].id,
+        student_id=st1.id,
+        file_name="Otchet_50_Aliev.pdf",
+        file_path=os.path.abspath(os.path.join(cp_dir, cp50_file)),
+        version=1,
+        submitted_at=datetime(2026, 10, 14, 15, 10, 0),
+        status="UNDER_REVIEW"
+    )
+    db.add(sub2)
+
+    st1_cps[2].status = "NOT_SUBMITTED"
+    st1_cps[2].file_name = None
+    st1_cps[3].status = "NOT_SUBMITTED"
+    st1_cps[3].file_name = None
+
+    st4_cps = db.query(Checkpoint).filter(Checkpoint.student_id == st4.id).order_by(Checkpoint.stage.asc()).all()
+    cp4_file = f"cp_{st4_cps[0].id}_v1_omarov_stage25.pdf"
+    with open(os.path.join(cp_dir, cp4_file), "wb") as f:
+        f.write(DUMMY_PDF_PAYLOAD)
+    st4_cps[0].status = "UNDER_REVIEW"
+    st4_cps[0].file_name = cp4_file
+    st4_cps[0].updated_at = datetime(2026, 10, 14, 16, 0, 0)
+    sub4 = CheckpointSubmission(
+        checkpoint_id=st4_cps[0].id,
+        student_id=st4.id,
+        file_name="Otchet_25_Omarov.pdf",
+        file_path=os.path.abspath(os.path.join(cp_dir, cp4_file)),
+        version=1,
+        submitted_at=datetime(2026, 10, 14, 16, 0, 0),
+        status="UNDER_REVIEW"
+    )
+    db.add(sub4)
+
+    # 6. Notifications for Student 1 (Хронология: Одобрено -> Доработка 25% -> Принято 25% -> Сдано 50%)
+    db.add(Notification(
+        user_id=st1.id,
+        title="Заявка одобрена",
+        message="Руководитель утвердил тему «Разработка веб-платформы автоматизации распределения дипломных работ». Статус: APPROVED",
+        type="success",
+        is_read=True,
+        created_at=datetime(2026, 10, 12, 14, 0, 0)
+    ))
+    db.add(Notification(
+        user_id=st1.id,
+        title="Контрольная точка Этап 25%",
+        message="Статус проверки: REVISION. Комментарий руководителя: Уточнить раздел 1.2 по ГОСТ и дополнить обзор аналогов.",
+        type="warning",
+        is_read=True,
+        created_at=datetime(2026, 10, 13, 10, 15, 0)
+    ))
+    db.add(Notification(
+        user_id=st1.id,
+        title="Контрольная точка Этап 25%",
+        message="Статус проверки: ACCEPTED. Комментарий руководителя: Замечания устранены, этап 25% принят в полном объеме.",
+        type="success",
+        is_read=True,
+        created_at=datetime(2026, 10, 13, 16, 45, 0)
+    ))
+    db.add(Notification(
+        user_id=st1.id,
+        title="Контрольная точка Этап 25%",
+        message="Статус проверки: ACCEPTED. Комментарий руководителя: Введение и архитектурный обзор приняты в полном объеме. Замечаний нет.",
+        type="success",
+        is_read=False,
+        created_at=datetime(2026, 10, 13, 11, 20, 0)
+    ))
+    db.add(Notification(
+        user_id=st1.id,
+        title="Решение по заявке",
+        message="Тема «Разработка веб-платформы автоматизации распределения дипломных работ»: APPROVED",
+        type="info",
+        is_read=True,
+        created_at=datetime(2026, 10, 12, 16, 30, 0)
+    ))
+    db.add(Notification(
+        user_id=st1.id,
+        title="Контрольная точка Этап 50%",
+        message="Отчет успешно загружен и ожидает проверки научным руководителем.",
+        type="submit",
+        is_read=False,
+        created_at=datetime(2026, 10, 14, 15, 10, 0)
+    ))
+
+    # 7. OfficialOrder & signed PDF
+    os.makedirs(ORDERS_DIR, exist_ok=True)
+    order = db.query(OfficialOrder).filter(OfficialOrder.verification_code == "ORDER-2026-01").first()
+    if not order:
+        order = OfficialOrder(
+            order_number="104-ОД",
+            academic_year="2026-2027",
+            created_at=datetime(2026, 10, 11, 10, 0, 0),
+            created_by=head.id,
+            status="DRAFT",
+            verification_code="ORDER-2026-01"
+        )
+        db.add(order)
+        db.flush()
+    else:
+        order.order_number = "104-ОД"
+        order.academic_year = "2026-2027"
+        order.created_at = datetime(2026, 10, 11, 10, 0, 0)
+        order.status = "DRAFT"
+        db.flush()
+
+    sync_order_items(order, db)
+    pdf_path, d_hash = ensure_order_pdf(order, db, force=True)
+    order.status = "SIGNED"
+    order.document_hash = d_hash
+    db.commit()
+
+@app.post("/api/demo/reset")
+async def api_reset_demo(
+    db: Session = Depends(get_db, scope="function"),
+    current_user: User = Depends(require_role("admin"))
+):
+    # Reset is an explicit maintenance operation, never enabled by the demo
+    # launcher alone. Keep it disabled until using a disposable demo database.
+    if (
+        os.environ.get("META_SEED_DEMO") != "1"
+        or os.environ.get("META_ALLOW_DEMO_RESET") != "1"
+    ):
+        raise HTTPException(status_code=403, detail="Сброс демонстрационной базы отключён")
+    reset_demo_state(db)
+    await ws_manager.broadcast({
+        "event": "DEMO_RESET",
+        "message": "Демонстрационная база данных сброшена в исходное эталонное состояние"
+    })
+    return {"status": "success", "message": "Демонстрационная база данных успешно сброшена в эталонное состояние"}

@@ -1,0 +1,119 @@
+{
+  "original_sha256": "60b5546d158030339e0efd5de5915005b95cdeda3a3a91d764c1afd93339de38",
+  "backup_sha256": "60b5546d158030339e0efd5de5915005b95cdeda3a3a91d764c1afd93339de38",
+  "repaired_sha256": "010b7c13cd9982863aafc929b308fe661d36dd6a1cdabebeca63a64f7a3694e3",
+  "checkpoint_fk_added": true,
+  "checkpoint_rows_preserved": 2836,
+  "application_change": {
+    "id": 6,
+    "student_id": 2,
+    "topic_id": 2,
+    "status_before": "CONFIRMED_BY_HEAD",
+    "status_after": "REJECTED",
+    "priority_unchanged": 1,
+    "reason": "Compatibility repair: duplicate assignment; signed OfficialOrder preserves application #2/topic #1."
+  },
+  "retained_application": {
+    "id": 2,
+    "topic_id": 1,
+    "status": "APPROVED",
+    "signed_order_evidence": true
+  },
+  "quota_changes": [
+    {
+      "topic_id": 1,
+      "before": {
+        "quota_used": 5,
+        "quota_total": 5,
+        "status": "full"
+      },
+      "after": {
+        "quota_used": 202,
+        "quota_total": 202,
+        "status": "full"
+      },
+      "row_changed": true
+    },
+    {
+      "topic_id": 2,
+      "before": {
+        "quota_used": 4,
+        "quota_total": 4,
+        "status": "full"
+      },
+      "after": {
+        "quota_used": 4,
+        "quota_total": 4,
+        "status": "full"
+      },
+      "row_changed": false
+    },
+    {
+      "topic_id": 3,
+      "before": {
+        "quota_used": 5,
+        "quota_total": 5,
+        "status": "full"
+      },
+      "after": {
+        "quota_used": 22,
+        "quota_total": 22,
+        "status": "full"
+      },
+      "row_changed": true
+    },
+    {
+      "topic_id": 4,
+      "before": {
+        "quota_used": 4,
+        "quota_total": 4,
+        "status": "full"
+      },
+      "after": {
+        "quota_used": 18,
+        "quota_total": 18,
+        "status": "full"
+      },
+      "row_changed": true
+    },
+    {
+      "topic_id": 5,
+      "before": {
+        "quota_used": 5,
+        "quota_total": 5,
+        "status": "full"
+      },
+      "after": {
+        "quota_used": 28,
+        "quota_total": 28,
+        "status": "full"
+      },
+      "row_changed": true
+    }
+  ],
+  "counts_preserved": {
+    "users": 795,
+    "audit_logs": 3908,
+    "checkpoints": 2836,
+    "sessions": 2649,
+    "custom_topic_proposals": 0,
+    "checkpoint_submissions": 71,
+    "notifications": 806,
+    "official_orders": 1,
+    "order_items": 274,
+    "topics": 6,
+    "applications": 551,
+    "preferences": 530
+  },
+  "changed_application_ids": [
+    6
+  ],
+  "changed_topic_ids": [
+    1,
+    3,
+    4,
+    5
+  ],
+  "integrity_check": "ok",
+  "foreign_key_violations": 0
+}

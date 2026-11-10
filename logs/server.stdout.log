@@ -1,0 +1,12 @@
+
+META_AUDITED_172
+Local:   http://127.0.0.1:8002/
+Network: http://192.168.123.7:8002/
+Stop the server with Ctrl+C.
+
+INFO:     127.0.0.1:57538 - "GET / HTTP/1.1" 200 OK
+INFO:     192.168.123.7:57540 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57541 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51496 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51496 - "GET /api/topics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51496 - "GET /favicon.ico HTTP/1.1" 404 Not Found

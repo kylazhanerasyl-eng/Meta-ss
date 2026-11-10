@@ -1,0 +1,40 @@
+# Virtual environments
+py_env/
+venv/
+.venv/
+env/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest & coverage cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Database backups & local files
+*.db.bak
+backups/
+scratch/
+
+# Uploads & temporary artifacts
+uploads/checkpoints/*
+!uploads/checkpoints/.gitkeep
+uploads/orders/*
+!uploads/orders/.gitkeep
+
+# Environment variables & secrets
+.env
+.env.local
+
+# OS & IDE artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local archives and installers
+*.zip
+*.exe
